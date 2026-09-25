@@ -67,6 +67,16 @@ jobs:
           settings.write_text(source.replace(original,
                               'var aiBackend: AIBackendType = .openAI'), encoding='utf-8')
 
+          # MLX's optional FoundationModels adapter targets a different Apple
+          # API revision. OpenVision uses its own Apple service and does not
+          # need this adapter. Explicit empty traits disable package defaults.
+          project = root / 'project.yml'
+          specification = project.read_text(encoding='utf-8')
+          pin = '    revision: "68947ccdca79bcf7a26dc220f73caa060369513c"'
+          if specification.count(pin) != 1:
+              raise SystemExit('Unexpected MLX package pin; review before building.')
+          project.write_text(specification.replace(pin, pin + '\n    traits: []'), encoding='utf-8')
+
           # Use the glasses for the actual test. No API keys, Apple passwords,
           # developer certificates or user data are embedded in this build.
           info = root / 'OpenVision/Resources/Info.plist'
