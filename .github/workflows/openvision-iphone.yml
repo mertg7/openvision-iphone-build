@@ -1,0 +1,142 @@
+name: OpenVision iPhone deneme derlemesi
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openvision-personal-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 75
+    steps:
+      - name: Sabitlenmis OpenVision kaynak kodunu al
+        uses: actions/checkout@v4
+        with:
+          repository: rayl15/OpenVision
+          ref: 1e88c3f21f4521c953bb8a1e4e60be865e3893b4
+          persist-credentials: false
+
+      - name: Derleme araclarini hazirla
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun swift --version
+          brew install xcodegen
+          xcodebuild -downloadComponent MetalToolchain
+          mkdir -p build
+
+      - name: Kisisel deneme ayarlari
+        shell: bash
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import plistlib
+          import shutil
+
+          root = pathlib.Path.cwd()
+          identifier = 'app.personal.openvision.r' + os.environ['REPOSITORY_ID']
+          root.joinpath('Config.xcconfig').write_text(
+              'DEVELOPMENT_TEAM =\n'
+              f'PRODUCT_BUNDLE_IDENTIFIER = {identifier}\n'
+              'META_APP_ID = 0\n'
+              'CLIENT_TOKEN =\n'
+              'APP_LINK_URL_SCHEME = openvision\n', encoding='utf-8')
+          shutil.copyfile(root / 'OpenVision/Config/Config.swift.example',
+                          root / 'OpenVision/Config/Config.swift')
+
+          # Personal signing may not support increased-memory-limit. This build
+          # targets the cloud OpenAI backend; avoid memory-heavy local models.
+          entitlement = root / 'OpenVision/OpenVision.entitlements'
+          entitlement.write_bytes(plistlib.dumps({}))
+          settings = root / 'OpenVision/Models/AppSettings.swift'
+          source = settings.read_text(encoding='utf-8')
+          original = 'var aiBackend: AIBackendType = .openClaw'
+          if source.count(original) != 1:
+              raise SystemExit('Unexpected upstream settings; review before building.')
+          settings.write_text(source.replace(original,
+                              'var aiBackend: AIBackendType = .openAI'), encoding='utf-8')
+
+          # Use the glasses for the actual test. No API keys, Apple passwords,
+          # developer certificates or user data are embedded in this build.
+          info = root / 'OpenVision/Resources/Info.plist'
+          data = plistlib.loads(info.read_bytes())
+          data['UIRequiredDeviceCapabilities'] = ['arm64', 'microphone']
+          info.write_bytes(plistlib.dumps(data))
+          PY
+          xcodegen generate
+
+      - name: iPhone uygulamasini imzasiz derle
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project OpenVision.xcodeproj \
+            -scheme OpenVision \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            -jobs 2 \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGN_ENTITLEMENTS= \
+            DEVELOPMENT_TEAM= \
+            build 2>&1 | tee build/xcodebuild.log
+
+      - name: Windows icin IPA dosyasini paketle
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH='build/DerivedData/Build/Products/Release-iphoneos/OpenVision.app'
+          test -f "$APP_PATH/OpenVision"
+          mkdir -p build/package/Payload
+          ditto "$APP_PATH" build/package/Payload/OpenVision.app
+          ditto -c -k --keepParent build/package/Payload build/OpenVision-unsigned.ipa
+          shasum -a 256 build/OpenVision-unsigned.ipa > build/SHA256.txt
+          printf '%s\n' \
+            'Unsigned personal test build. Sign/install locally with Sideloadly.' \
+            'No Apple password or OpenAI key is included.' \
+            'Meta developer mode is required. Camera connection has not been tested.' \
+            'Use the OpenAI backend, not large on-device MLX models.' \
+            > build/READ-FIRST.txt
+          printf '%s\n' \
+            '### OpenVision derlemesi tamamlandi' \
+            'Dosyalar asagidaki OpenVision-iPhone-deneme ekindedir.' \
+            'Bu sonuc kamera, mikrofon veya iOS 27 cihaz testinin gectigi anlamina gelmez.' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: IPA dosyasini indirilebilir yap
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVision-iPhone-deneme
+          path: |
+            build/OpenVision-unsigned.ipa
+            build/SHA256.txt
+            build/READ-FIRST.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Hata incelemesi icin derleme kaydini sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVision-derleme-kaydi
+          path: |
+            build/xcodebuild.log
+            OpenVision.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          if-no-files-found: ignore
+          retention-days: 3
+
