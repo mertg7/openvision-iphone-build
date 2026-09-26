@@ -86,6 +86,590 @@ jobs:
           PY
           xcodegen generate
 
+      - name: Sesli uyandirma gecisini duzelt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check <<'WAKE_PATCH'
+          --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
+          +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
+          @@ -50,6 +50,8 @@
+               private var lastProcessedCommand = ""
+               private var lastProcessedAt = Date.distantPast
+               private var hasRequestedSpeechAuth = false
+          +    // Serialize microphone handoffs. Engine/SDK callbacks can arrive during teardown.
+          +    private var isChangingLiveMode = false
+           
+               /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
+               /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
+          @@ -126,6 +128,11 @@
+               // MARK: - Observed state changes (forwarded from the view's onChange hooks)
+           
+               func ttsSpeakingChanged(_ isSpeaking: Bool) {
+          +        guard !isChangingLiveMode else { return }
+          +        if isLiveVideoMode, activeLiveService != nil {
+          +            agentState = .liveVideo
+          +            return
+          +        }
+                   if isSpeaking {
+                       agentState = .speaking
+                       // Pause barge-in detection while TTS is playing
+          @@ -183,6 +190,11 @@
+               }
+           
+               func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
+          +        guard !isChangingLiveMode else { return }
+          +        if isLiveVideoMode, activeLiveService != nil {
+          +            agentState = .liveVideo
+          +            return
+          +        }
+                   print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
+                   switch newState {
+                   case .idle:
+          @@ -254,6 +266,7 @@
+               }
+           
+               func startSession() {
+          +        guard !isChangingLiveMode, !isSessionActive else { return }
+                   // Check configuration
+                   guard settingsManager.settings.isCurrentBackendConfigured else {
+                       errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
+          @@ -262,6 +275,13 @@
+           
+                   isSessionActive = true
+                   agentState = .connecting
+          +
+          +        // Gemini replies are native audio. The live path owns capture, playback and
+          +        // camera callbacks; the text-only startup never installed its audio callback.
+          +        if settingsManager.settings.aiBackend == .geminiLive {
+          +            Task { await startLiveVideoMode() }
+          +            return
+          +        }
+           
+                   // Model memory follows the History conversation window (5-min inactivity), NOT the wake
+                   // session — every "Ok Vision" starts a new session, so clearing here made "what were we
+          @@ -382,11 +402,13 @@
+               }
+           
+               func stopSession() {
+          +        guard !isChangingLiveMode else { return }
+                   // If in live video mode, stop it first
+                   if isLiveVideoMode {
+                       Task {
+                           await stopLiveVideoMode()
+                       }
+          +            return
+                   }
+           
+                   Task {
+          @@ -533,6 +555,7 @@
+                   // Wake word detected
+                   voiceCommandService.onWakeWordDetected = { [weak self] in
+                       guard let self else { return }
+          +            guard !self.isChangingLiveMode else { return }
+                       print("[VoiceAgent] Wake word detected!")
+                       HapticFeedback.medium()
+                       self.soundService.playWakeWordSound()
+          @@ -795,6 +818,7 @@
+           
+               /// Start listening for wake word
+               private func startWakeWordListening() {
+          +        guard !isChangingLiveMode, !isLiveVideoMode else { return }
+                   guard settingsManager.settings.wakeWordEnabled else { return }
+                   guard voiceCommandService.authorizationStatus == .authorized else { return }
+           
+          @@ -971,12 +995,15 @@
+           
+               /// Start live video mode - Gemini handles both audio and video
+               private func startLiveVideoMode() async {
+          +        guard !isChangingLiveMode else { return }
+                   guard !isLiveVideoMode else {
+                       print("[VoiceAgent] Already in live video mode")
+                       return
+                   }
+           
+                   guard glassesManager.isRegistered else {
+          +            isSessionActive = false
+          +            agentState = .idle
+                       ttsService.speak("Please connect your glasses first")
+                       return
+                   }
+          @@ -992,9 +1019,14 @@
+                   // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
+                   // otherwise Gemini Live (the default video provider for every other backend).
+                   guard let (service, label) = resolveLiveService() else {
+          +            isSessionActive = false
+          +            agentState = .idle
+                       ttsService.speak("Please configure your Gemini or OpenAI API key in settings")
+                       return
+                   }
+          +        isChangingLiveMode = true
+          +        defer { isChangingLiveMode = false }
+          +        agentState = .connecting
+                   activeLiveService = service
+           
+                   print("[VoiceAgent] Starting live video mode via \(label)...")
+          @@ -1021,17 +1053,7 @@
+                       try await service.connect()
+                   } catch {
+                       errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
+          -            activeLiveService = nil
+          -            // Cleanup: stop streaming and restart voice commands
+          -            if glassesManager.isStreaming {
+          -                await glassesManager.stopStreaming()
+          -            }
+          -            do {
+          -                try voiceCommandService.startListening()
+          -                voiceCommandService.enterConversationMode()
+          -            } catch {
+          -                print("[VoiceAgent] Failed to restart voice commands: \(error)")
+          -            }
+          +            await finishLiveSession()
+                       return
+                   }
+           
+          @@ -1045,9 +1067,14 @@
+           
+                   // Setup audio playback
+                   do {
+          +            // Match the route used by the working explicit-video path: camera
+          +            // streaming can make the glasses' HFP input unavailable.
+          +            applyPreferredAudioRoute()
+                       try audioPlayback.setup()
+                   } catch {
+          -            print("[VoiceAgent] Failed to setup audio playback: \(error)")
+          +            errorMessage = "Failed to start audio playback: \(error.localizedDescription)"
+          +            await finishLiveSession()
+          +            return
+                   }
+           
+                   // Start audio capture
+          @@ -1055,9 +1082,7 @@
+                       try audioCapture.startCapture()
+                   } catch {
+                       errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
+          -            await service.disconnect()
+          -            activeLiveService = nil
+          -            voiceCommandService.enterConversationMode()
+          +            await finishLiveSession()
+                       return
+                   }
+           
+          @@ -1069,6 +1094,7 @@
+                   }
+           
+                   isLiveVideoMode = true
+          +        isSessionActive = true
+                   agentState = .liveVideo
+           
+                   print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
+          @@ -1488,60 +1514,69 @@
+           
+               /// Stop live video mode
+               private func stopLiveVideoMode() async {
+          -        guard isLiveVideoMode else {
+          -            print("[VoiceAgent] Not in live video mode")
+          -            return
+          -        }
+          +        guard isLiveVideoMode, !isChangingLiveMode else { return }
+          +        isChangingLiveMode = true
+          +        defer { isChangingLiveMode = false }
+          +        await finishLiveSession()
+          +    }
+          +
+          +    /// Called with the handoff guard held, including partial-start failures.
+          +    private func finishLiveSession() async {
+          +        // Clear state and callbacks BEFORE disconnect: the SDK can report its own
+          +        // disconnect while we await it. It must not start a second teardown.
+          +        isLiveVideoMode = false
+          +        isSessionActive = false
+          +        agentState = .idle
+          +        commandTurnActive = false
+          +        ttsStreaming = false
+          +        ttsService.stop()
+          +        KokoroTTSService.shared.stop()
+          +        soundService.stopThinkingSound()
+                   stopWatchLoop()
+          -
+          -        print("[VoiceAgent] Stopping live video mode...")
+          -
+          -        // Stop audio capture
+          +        voiceCommandService.stopListening()
+          +        voiceCommandService.isBargeInPaused = false
+          +
+          +        let service = activeLiveService
+          +        activeLiveService = nil
+          +        service?.onDisconnected = nil
+          +        service?.onAudioReceived = nil
+          +        service?.onInputTranscription = nil
+          +        service?.onOutputTranscription = nil
+          +        service?.onTurnComplete = nil
+          +        audioCapture.onAudioCaptured = nil
+                   audioCapture.stopCapture()
+          -        audioCapture.onAudioCaptured = nil
+          -
+          -        // Stop audio playback
+                   audioPlayback.teardown()
+          -
+          -        // Disconnect the active live backend (Gemini or OpenAI Realtime)
+          -        await activeLiveService?.disconnect()
+          -        activeLiveService = nil
+          -
+          -        // Stop glasses streaming
+          +        await service?.disconnect()
+                   if glassesManager.isStreaming {
+                       await glassesManager.stopStreaming()
+                   }
+          -
+          -        // Restore video frame callback to Gemini Vision
+                   glassesManager.onVideoFrame = { [weak self] image in
+                       self?.geminiVision.sendVideoFrame(image)
+                   }
+          -
+          -        isLiveVideoMode = false
+          -        agentState = isSessionActive ? .listening : .idle
+          -
+          -        // Local live mode forced the phone mic (HFP dies during camera streaming) and its STT
+          -        // may still be running — stop it so the restart below picks up the preferred route.
+          -        if voiceCommandService.isListening { voiceCommandService.stopListening() }
+          -        applyPreferredAudioRoute()
+          -
+          -        // Always restart VoiceCommandService for wake word detection
+          -        do {
+          -            try voiceCommandService.startListening()
+          -            if isSessionActive {
+          -                // Continue conversation mode if session was active
+          -                voiceCommandService.enterConversationMode()
+          -                print("[VoiceAgent] Restarted voice commands in conversation mode")
+          -            } else {
+          -                // Just listen for wake word
+          -                print("[VoiceAgent] Restarted voice commands for wake word detection")
+          -            }
+          -        } catch {
+          -            print("[VoiceAgent] Failed to restart voice commands: \(error)")
+          -        }
+          -
+          -        print("[VoiceAgent] Live video mode stopped")
+          -        ttsService.speak("Live video mode ended")
+          +        userTranscript = ""
+          +        aiTranscript = ""
+          +        currentToolName = nil
+          +        isVoiceReady = false
+          +
+          +        guard settingsManager.settings.wakeWordEnabled else { return }
+          +        // Let Bluetooth settle after camera shutdown. A failed microphone start
+          +        // used to be logged only, leaving the app silently deaf until relaunched.
+          +        for attempt in 0..<3 {
+          +            if attempt > 0 {
+          +                try? await Task.sleep(nanoseconds: 350_000_000)
+          +                voiceCommandService.stopListening()
+          +            }
+          +            applyPreferredAudioRoute()
+          +            do {
+          +                try voiceCommandService.startListening()
+          +                isVoiceReady = true
+          +                return
+          +            } catch {
+          +                if attempt == 2 {
+          +                    errorMessage = "Couldn't restart wake-word listening: \(error.localizedDescription). Return to Voice and try again."
+          +                }
+          +            }
+          +        }
+               }
+           
+               /// Setup live backend callbacks for audio/transcription (Gemini Live or OpenAI Realtime)
+          WAKE_PATCH
+          git apply <<'WAKE_PATCH'
+          --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
+          +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
+          @@ -50,6 +50,8 @@
+               private var lastProcessedCommand = ""
+               private var lastProcessedAt = Date.distantPast
+               private var hasRequestedSpeechAuth = false
+          +    // Serialize microphone handoffs. Engine/SDK callbacks can arrive during teardown.
+          +    private var isChangingLiveMode = false
+           
+               /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
+               /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
+          @@ -126,6 +128,11 @@
+               // MARK: - Observed state changes (forwarded from the view's onChange hooks)
+           
+               func ttsSpeakingChanged(_ isSpeaking: Bool) {
+          +        guard !isChangingLiveMode else { return }
+          +        if isLiveVideoMode, activeLiveService != nil {
+          +            agentState = .liveVideo
+          +            return
+          +        }
+                   if isSpeaking {
+                       agentState = .speaking
+                       // Pause barge-in detection while TTS is playing
+          @@ -183,6 +190,11 @@
+               }
+           
+               func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
+          +        guard !isChangingLiveMode else { return }
+          +        if isLiveVideoMode, activeLiveService != nil {
+          +            agentState = .liveVideo
+          +            return
+          +        }
+                   print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
+                   switch newState {
+                   case .idle:
+          @@ -254,6 +266,7 @@
+               }
+           
+               func startSession() {
+          +        guard !isChangingLiveMode, !isSessionActive else { return }
+                   // Check configuration
+                   guard settingsManager.settings.isCurrentBackendConfigured else {
+                       errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
+          @@ -262,6 +275,13 @@
+           
+                   isSessionActive = true
+                   agentState = .connecting
+          +
+          +        // Gemini replies are native audio. The live path owns capture, playback and
+          +        // camera callbacks; the text-only startup never installed its audio callback.
+          +        if settingsManager.settings.aiBackend == .geminiLive {
+          +            Task { await startLiveVideoMode() }
+          +            return
+          +        }
+           
+                   // Model memory follows the History conversation window (5-min inactivity), NOT the wake
+                   // session — every "Ok Vision" starts a new session, so clearing here made "what were we
+          @@ -382,11 +402,13 @@
+               }
+           
+               func stopSession() {
+          +        guard !isChangingLiveMode else { return }
+                   // If in live video mode, stop it first
+                   if isLiveVideoMode {
+                       Task {
+                           await stopLiveVideoMode()
+                       }
+          +            return
+                   }
+           
+                   Task {
+          @@ -533,6 +555,7 @@
+                   // Wake word detected
+                   voiceCommandService.onWakeWordDetected = { [weak self] in
+                       guard let self else { return }
+          +            guard !self.isChangingLiveMode else { return }
+                       print("[VoiceAgent] Wake word detected!")
+                       HapticFeedback.medium()
+                       self.soundService.playWakeWordSound()
+          @@ -795,6 +818,7 @@
+           
+               /// Start listening for wake word
+               private func startWakeWordListening() {
+          +        guard !isChangingLiveMode, !isLiveVideoMode else { return }
+                   guard settingsManager.settings.wakeWordEnabled else { return }
+                   guard voiceCommandService.authorizationStatus == .authorized else { return }
+           
+          @@ -971,12 +995,15 @@
+           
+               /// Start live video mode - Gemini handles both audio and video
+               private func startLiveVideoMode() async {
+          +        guard !isChangingLiveMode else { return }
+                   guard !isLiveVideoMode else {
+                       print("[VoiceAgent] Already in live video mode")
+                       return
+                   }
+           
+                   guard glassesManager.isRegistered else {
+          +            isSessionActive = false
+          +            agentState = .idle
+                       ttsService.speak("Please connect your glasses first")
+                       return
+                   }
+          @@ -992,9 +1019,14 @@
+                   // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
+                   // otherwise Gemini Live (the default video provider for every other backend).
+                   guard let (service, label) = resolveLiveService() else {
+          +            isSessionActive = false
+          +            agentState = .idle
+                       ttsService.speak("Please configure your Gemini or OpenAI API key in settings")
+                       return
+                   }
+          +        isChangingLiveMode = true
+          +        defer { isChangingLiveMode = false }
+          +        agentState = .connecting
+                   activeLiveService = service
+           
+                   print("[VoiceAgent] Starting live video mode via \(label)...")
+          @@ -1021,17 +1053,7 @@
+                       try await service.connect()
+                   } catch {
+                       errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
+          -            activeLiveService = nil
+          -            // Cleanup: stop streaming and restart voice commands
+          -            if glassesManager.isStreaming {
+          -                await glassesManager.stopStreaming()
+          -            }
+          -            do {
+          -                try voiceCommandService.startListening()
+          -                voiceCommandService.enterConversationMode()
+          -            } catch {
+          -                print("[VoiceAgent] Failed to restart voice commands: \(error)")
+          -            }
+          +            await finishLiveSession()
+                       return
+                   }
+           
+          @@ -1045,9 +1067,14 @@
+           
+                   // Setup audio playback
+                   do {
+          +            // Match the route used by the working explicit-video path: camera
+          +            // streaming can make the glasses' HFP input unavailable.
+          +            applyPreferredAudioRoute()
+                       try audioPlayback.setup()
+                   } catch {
+          -            print("[VoiceAgent] Failed to setup audio playback: \(error)")
+          +            errorMessage = "Failed to start audio playback: \(error.localizedDescription)"
+          +            await finishLiveSession()
+          +            return
+                   }
+           
+                   // Start audio capture
+          @@ -1055,9 +1082,7 @@
+                       try audioCapture.startCapture()
+                   } catch {
+                       errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
+          -            await service.disconnect()
+          -            activeLiveService = nil
+          -            voiceCommandService.enterConversationMode()
+          +            await finishLiveSession()
+                       return
+                   }
+           
+          @@ -1069,6 +1094,7 @@
+                   }
+           
+                   isLiveVideoMode = true
+          +        isSessionActive = true
+                   agentState = .liveVideo
+           
+                   print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
+          @@ -1488,60 +1514,69 @@
+           
+               /// Stop live video mode
+               private func stopLiveVideoMode() async {
+          -        guard isLiveVideoMode else {
+          -            print("[VoiceAgent] Not in live video mode")
+          -            return
+          -        }
+          +        guard isLiveVideoMode, !isChangingLiveMode else { return }
+          +        isChangingLiveMode = true
+          +        defer { isChangingLiveMode = false }
+          +        await finishLiveSession()
+          +    }
+          +
+          +    /// Called with the handoff guard held, including partial-start failures.
+          +    private func finishLiveSession() async {
+          +        // Clear state and callbacks BEFORE disconnect: the SDK can report its own
+          +        // disconnect while we await it. It must not start a second teardown.
+          +        isLiveVideoMode = false
+          +        isSessionActive = false
+          +        agentState = .idle
+          +        commandTurnActive = false
+          +        ttsStreaming = false
+          +        ttsService.stop()
+          +        KokoroTTSService.shared.stop()
+          +        soundService.stopThinkingSound()
+                   stopWatchLoop()
+          -
+          -        print("[VoiceAgent] Stopping live video mode...")
+          -
+          -        // Stop audio capture
+          +        voiceCommandService.stopListening()
+          +        voiceCommandService.isBargeInPaused = false
+          +
+          +        let service = activeLiveService
+          +        activeLiveService = nil
+          +        service?.onDisconnected = nil
+          +        service?.onAudioReceived = nil
+          +        service?.onInputTranscription = nil
+          +        service?.onOutputTranscription = nil
+          +        service?.onTurnComplete = nil
+          +        audioCapture.onAudioCaptured = nil
+                   audioCapture.stopCapture()
+          -        audioCapture.onAudioCaptured = nil
+          -
+          -        // Stop audio playback
+                   audioPlayback.teardown()
+          -
+          -        // Disconnect the active live backend (Gemini or OpenAI Realtime)
+          -        await activeLiveService?.disconnect()
+          -        activeLiveService = nil
+          -
+          -        // Stop glasses streaming
+          +        await service?.disconnect()
+                   if glassesManager.isStreaming {
+                       await glassesManager.stopStreaming()
+                   }
+          -
+          -        // Restore video frame callback to Gemini Vision
+                   glassesManager.onVideoFrame = { [weak self] image in
+                       self?.geminiVision.sendVideoFrame(image)
+                   }
+          -
+          -        isLiveVideoMode = false
+          -        agentState = isSessionActive ? .listening : .idle
+          -
+          -        // Local live mode forced the phone mic (HFP dies during camera streaming) and its STT
+          -        // may still be running — stop it so the restart below picks up the preferred route.
+          -        if voiceCommandService.isListening { voiceCommandService.stopListening() }
+          -        applyPreferredAudioRoute()
+          -
+          -        // Always restart VoiceCommandService for wake word detection
+          -        do {
+          -            try voiceCommandService.startListening()
+          -            if isSessionActive {
+          -                // Continue conversation mode if session was active
+          -                voiceCommandService.enterConversationMode()
+          -                print("[VoiceAgent] Restarted voice commands in conversation mode")
+          -            } else {
+          -                // Just listen for wake word
+          -                print("[VoiceAgent] Restarted voice commands for wake word detection")
+          -            }
+          -        } catch {
+          -            print("[VoiceAgent] Failed to restart voice commands: \(error)")
+          -        }
+          -
+          -        print("[VoiceAgent] Live video mode stopped")
+          -        ttsService.speak("Live video mode ended")
+          +        userTranscript = ""
+          +        aiTranscript = ""
+          +        currentToolName = nil
+          +        isVoiceReady = false
+          +
+          +        guard settingsManager.settings.wakeWordEnabled else { return }
+          +        // Let Bluetooth settle after camera shutdown. A failed microphone start
+          +        // used to be logged only, leaving the app silently deaf until relaunched.
+          +        for attempt in 0..<3 {
+          +            if attempt > 0 {
+          +                try? await Task.sleep(nanoseconds: 350_000_000)
+          +                voiceCommandService.stopListening()
+          +            }
+          +            applyPreferredAudioRoute()
+          +            do {
+          +                try voiceCommandService.startListening()
+          +                isVoiceReady = true
+          +                return
+          +            } catch {
+          +                if attempt == 2 {
+          +                    errorMessage = "Couldn't restart wake-word listening: \(error.localizedDescription). Return to Voice and try again."
+          +                }
+          +            }
+          +        }
+               }
+           
+               /// Setup live backend callbacks for audio/transcription (Gemini Live or OpenAI Realtime)
+          WAKE_PATCH
+          xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
+
       - name: iPhone uygulamasini imzasiz derle
         shell: bash
         run: |
@@ -104,6 +688,7 @@ jobs:
             CODE_SIGN_IDENTITY= \
             CODE_SIGN_ENTITLEMENTS= \
             DEVELOPMENT_TEAM= \
+            CURRENT_PROJECT_VERSION=2 \
             build 2>&1 | tee build/xcodebuild.log
 
       - name: Windows icin IPA dosyasini paketle
@@ -149,4 +734,3 @@ jobs:
             OpenVision.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
           if-no-files-found: ignore
           retention-days: 3
-
