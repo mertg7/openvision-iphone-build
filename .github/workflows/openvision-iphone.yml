@@ -1425,14 +1425,15 @@ jobs:
            
           --- /dev/null
           +++ b/OpenVision/Services/Audio/MicrophoneInputRouter.swift
-          @@ -0,0 +1,40 @@
+          @@ -0,0 +1,41 @@
           +import AVFoundation
           +import Foundation
           +
           +/// One hardware tap, with a replaceable consumer. Swapping wake/live consumers
           +/// must not stop the microphone that was started while the app was foreground.
           +final class MicrophoneInputRouter: @unchecked Sendable {
-          +    typealias Sink = (AVAudioPCMBuffer) -> Void
+          +    // Audio callbacks run off the UI actor; do not inherit its isolation at creation.
+          +    typealias Sink = @Sendable (AVAudioPCMBuffer) -> Void
           +    private let lock = NSLock()
           +    private var sink: Sink?
           +
@@ -2887,14 +2888,15 @@ jobs:
            
           --- /dev/null
           +++ b/OpenVision/Services/Audio/MicrophoneInputRouter.swift
-          @@ -0,0 +1,40 @@
+          @@ -0,0 +1,41 @@
           +import AVFoundation
           +import Foundation
           +
           +/// One hardware tap, with a replaceable consumer. Swapping wake/live consumers
           +/// must not stop the microphone that was started while the app was foreground.
           +final class MicrophoneInputRouter: @unchecked Sendable {
-          +    typealias Sink = (AVAudioPCMBuffer) -> Void
+          +    // Audio callbacks run off the UI actor; do not inherit its isolation at creation.
+          +    typealias Sink = @Sendable (AVAudioPCMBuffer) -> Void
           +    private let lock = NSLock()
           +    private var sink: Sink?
           +
@@ -3084,7 +3086,13 @@ jobs:
           
           @main
           struct MicrophoneRouterTests {
-              static func main() {
+              final class Counter: @unchecked Sendable {
+                  private let lock = NSLock()
+                  private var stored = 0
+                  func increment() { lock.lock(); stored += 1; lock.unlock() }
+                  var value: Int { lock.lock(); defer { lock.unlock() }; return stored }
+              }
+              @MainActor static func main() {
                   let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
                   let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 3)!
                   buffer.frameLength = 3
@@ -3097,26 +3105,39 @@ jobs:
                   precondition(samples[2] == 0.5, "Samples must survive native buffer reuse")
           
                   let router = MicrophoneInputRouter()
-                  var wakeFrames = 0
-                  var liveFrames = 0
-                  router.setSink { _ in wakeFrames += 1 }
+                  let wakeFrames = Counter()
+                  let liveFrames = Counter()
+                  router.setSink { _ in wakeFrames.increment() }
                   router.deliver(buffer)
-                  router.setSink { _ in liveFrames += 1 }
+                  router.setSink { _ in liveFrames.increment() }
                   router.deliver(buffer)
-                  precondition(wakeFrames == 1 && liveFrames == 1, "Exclusive wake/live routing")
+                  precondition(wakeFrames.value == 1 && liveFrames.value == 1, "Exclusive wake/live routing")
                   router.setSink(nil)
                   router.deliver(buffer)
-                  precondition(wakeFrames == 1 && liveFrames == 1, "Pause must not forward audio")
+                  precondition(wakeFrames.value == 1 && liveFrames.value == 1, "Pause must not forward audio")
                   router.setSink { _ in
-                      wakeFrames += 1
+                      wakeFrames.increment()
                       router.setSink(nil) // Reentrant teardown must not deadlock.
                   }
                   router.deliver(buffer)
                   router.deliver(buffer)
-                  precondition(wakeFrames == 2 && liveFrames == 1)
+                  precondition(wakeFrames.value == 2 && liveFrames.value == 1)
                   buffer.frameLength = 0
                   precondition(MicrophoneInputRouter.monoSamples(from: buffer).isEmpty)
+                  router.setSink { _ in wakeFrames.increment() }
+                  let done = DispatchSemaphore(value: 0)
+                  DispatchQueue.global().async {
+                      let f = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+                      let b = AVAudioPCMBuffer(pcmFormat: f, frameCapacity: 1)!
+                      b.frameLength = 1
+                      b.floatChannelData![0][0] = 0
+                      router.deliver(b)
+                      done.signal()
+                  }
+                  precondition(done.wait(timeout: .now() + 3) == .success)
+                  precondition(wakeFrames.value == 3, "Audio-thread delivery must not require the UI actor")
                   print("PASS: one input routed wake/live/wake, pause, reentrant detach, copied stereo/empty samples")
+                  print("PASS: UI-created consumer safely receives audio on a background thread")
               }
           }
           MIC_TESTS
