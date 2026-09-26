@@ -93,7 +93,7 @@ jobs:
           git apply --check <<'WAKE_PATCH'
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
-          @@ -50,6 +50,14 @@
+          @@ -50,6 +50,16 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
@@ -105,10 +105,12 @@ jobs:
           +    @Published var isContinuousLiveCamera = false
           +    private var snapshotTask: Task<Void, Never>?
           +    private var snapshotRequestedThisTurn = false
+          +    private var liveMicrophoneWatchdog: Timer?
+          +    private var lastLiveMicrophoneBufferAt = Date.distantPast
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -88,7 +96,7 @@
+          @@ -88,7 +98,7 @@
                        case .thinking: return "Thinking..."
                        case .speaking: return "Speaking..."
                        case .toolRunning: return "Running tool..."
@@ -117,7 +119,7 @@ jobs:
                        }
                    }
            
-          @@ -120,12 +128,19 @@
+          @@ -120,12 +130,19 @@
                }
            
                func onDisappear() {
@@ -138,7 +140,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +198,11 @@
+          @@ -183,6 +200,11 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -150,7 +152,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +274,7 @@
+          @@ -254,6 +276,7 @@
                }
            
                func startSession() {
@@ -158,7 +160,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +283,13 @@
+          @@ -262,6 +285,13 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -172,7 +174,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -382,11 +410,13 @@
+          @@ -382,11 +412,13 @@
                }
            
                func stopSession() {
@@ -186,7 +188,7 @@ jobs:
                    }
            
                    Task {
-          @@ -533,6 +563,7 @@
+          @@ -533,6 +565,7 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -194,7 +196,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -795,6 +826,7 @@
+          @@ -795,6 +828,7 @@
            
                /// Start listening for wake word
                private func startWakeWordListening() {
@@ -202,7 +204,7 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -970,13 +1002,16 @@
+          @@ -970,13 +1004,16 @@
                // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
@@ -220,7 +222,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,15 +1027,25 @@
+          @@ -992,15 +1029,25 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -248,7 +250,7 @@ jobs:
            
                    // Stop TTS if speaking
                    ttsService.stop()
-          @@ -1011,9 +1056,33 @@
+          @@ -1011,9 +1058,33 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -283,7 +285,7 @@ jobs:
                    }
            
                    // Connect to the live backend
-          @@ -1021,17 +1090,7 @@
+          @@ -1021,17 +1092,7 @@
                        try await service.connect()
                    } catch {
                        errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
@@ -302,17 +304,31 @@ jobs:
                        return
                    }
            
-          @@ -1043,11 +1102,18 @@
+          @@ -1039,42 +1100,66 @@
+                   setupLiveVideoCallbacks(service)
+           
+                   // Setup audio capture → live backend
+          -        audioCapture.onAudioCaptured = { [weak service] data in
+          +        audioCapture.onAudioCaptured = { [weak self, weak service] data in
+          +            guard let self, self.isLiveVideoMode else { return }
+          +            self.lastLiveMicrophoneBufferAt = Date()
                        service?.sendAudio(data: data)
                    }
            
-          +        // No await between ending the wake microphone and starting live capture.
-          +        voiceCommandService.stopListening()
+          +        // Preserve the already-running wake engine and its Bluetooth route while locked.
+          +        // Foreground camera use may have stopped it; only then prepare the route again.
+          +        if !voiceCommandService.isMicrophoneRunning {
+          +            voiceCommandService.stopListening()
+          +            applyPreferredAudioRoute()
+          +            do { try voiceCommandService.startListening() }
+          +            catch {
+          +                errorMessage = "Mikrofon hazır değil: \(error.localizedDescription). Voice ekranında yeniden dene."
+          +                await finishLiveSession()
+          +                return
+          +            }
+          +        }
                    // Setup audio playback
                    do {
-          +            // Match the route used by the working explicit-video path: camera
-          +            // streaming can make the glasses' HFP input unavailable.
-          +            applyPreferredAudioRoute()
                        try audioPlayback.setup()
                    } catch {
           -            print("[VoiceAgent] Failed to setup audio playback: \(error)")
@@ -322,8 +338,9 @@ jobs:
                    }
            
                    // Start audio capture
-          @@ -1055,26 +1121,24 @@
-                       try audioCapture.startCapture()
+                   do {
+          -            try audioCapture.startCapture()
+          +            try audioCapture.startCapture(sharedInput: voiceCommandService)
                    } catch {
                        errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
           -            await service.disconnect()
@@ -351,6 +368,16 @@ jobs:
                    isLiveVideoMode = true
           +        isSessionActive = true
                    agentState = .liveVideo
+          +        lastLiveMicrophoneBufferAt = Date()
+          +        liveMicrophoneWatchdog?.invalidate()
+          +        liveMicrophoneWatchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+          +            Task { @MainActor in
+          +                guard let self, self.isLiveVideoMode, !self.isCapturingSnapshot,
+          +                      Date().timeIntervalSince(self.lastLiveMicrophoneBufferAt) > 8 else { return }
+          +                self.errorMessage = "Mikrofon sesi kesildi. Telefonun kilidini açıp Voice ekranında yeniden dene."
+          +                await self.stopLiveVideoMode()
+          +            }
+          +        }
            
                    print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
            
@@ -360,7 +387,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1550,191 @@
+          @@ -1486,89 +1571,211 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -391,11 +418,13 @@ jobs:
           +            // Camera traffic can interrupt the glasses HFP route. Use the phone during
           +            // the short capture, then restore glasses audio after stopping the camera.
           +            self.audioCapture.stopCapture()
+          +            self.voiceCommandService.stopListening()
           +            self.audioPlayback.teardown()
           +            do {
           +                try AudioSessionManager.shared.configureForPhone()
           +                try self.audioPlayback.setup()
-          +                try self.audioCapture.startCapture()
+          +                try self.voiceCommandService.startListening()
+          +                try self.audioCapture.startCapture(sharedInput: self.voiceCommandService)
           +            } catch {
           +                self.errorMessage = "Kamera için ses bağlantısı hazırlanamadı."
           +                self.isCapturingSnapshot = false
@@ -416,11 +445,14 @@ jobs:
           +            if ownedStream { await self.glassesManager.stopStreaming() }
           +            guard !Task.isCancelled, self.isLiveVideoMode else { return }
           +            self.audioCapture.stopCapture()
+          +            self.voiceCommandService.stopListening()
           +            self.audioPlayback.teardown()
           +            self.applyPreferredAudioRoute()
           +            do {
           +                try self.audioPlayback.setup()
-          +                try self.audioCapture.startCapture()
+          +                try self.voiceCommandService.startListening()
+          +                try self.audioCapture.startCapture(sharedInput: self.voiceCommandService)
+          +                self.lastLiveMicrophoneBufferAt = Date()
           +                // Use the latest transcript; the request may have continued during capture.
           +                let fullQuestion = self.userTranscript.isEmpty ? question : self.userTranscript
           +                self.isCapturingSnapshot = false
@@ -457,6 +489,8 @@ jobs:
           +    private func finishLiveSession() async {
           +        let handoff = JarvisAudioHandoff(name: "Jarvis return to listening")
           +        defer { handoff.end() }
+          +        liveMicrophoneWatchdog?.invalidate()
+          +        liveMicrophoneWatchdog = nil
           +        // Clear state and callbacks BEFORE disconnect: the SDK can report its own
           +        // disconnect while we await it. It must not start a second teardown.
           +        isLiveVideoMode = false
@@ -472,7 +506,7 @@ jobs:
           -        print("[VoiceAgent] Stopping live video mode...")
           -
           -        // Stop audio capture
-          +        voiceCommandService.stopListening()
+          +        // Keep the shared hardware input alive until the wake recognizer takes it back.
           +        voiceCommandService.isBargeInPaused = false
           +
           +        snapshotTask?.cancel()
@@ -546,9 +580,22 @@ jobs:
           +        currentToolName = nil
           +        isVoiceReady = false
           +
-          +        guard settingsManager.settings.wakeWordEnabled else { return }
+          +        guard settingsManager.settings.wakeWordEnabled else {
+          +            voiceCommandService.stopListening()
+          +            return
+          +        }
+          +        if voiceCommandService.isMicrophoneRunning {
+          +            do {
+          +                try voiceCommandService.resumeWakeAfterLive()
+          +                isVoiceReady = true
+          +                return
+          +            } catch {
+          +                errorMessage = "Jarvis dinlemesine dönülemedi: \(error.localizedDescription)"
+          +            }
+          +        }
           +        // Let Bluetooth settle after camera shutdown. A failed microphone start
           +        // used to be logged only, leaving the app silently deaf until relaunched.
+          +        voiceCommandService.stopListening()
           +        for attempt in 0..<3 {
           +            if attempt > 0 {
           +                try? await Task.sleep(nanoseconds: 350_000_000)
@@ -615,7 +662,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1755,10 @@
+          @@ -1589,6 +1796,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -626,7 +673,15 @@ jobs:
                        }
                    }
            
-          @@ -1969,8 +2139,15 @@
+          @@ -1598,6 +1809,7 @@
+                           guard let self else { return }
+                           if self.isLiveVideoMode {
+                               print("[VoiceAgent] Live backend disconnected unexpectedly")
+          +                    self.errorMessage = "Canlı bağlantı kesildi. Voice ekranında yeniden dene."
+                               await self.stopLiveVideoMode()
+                           }
+                       }
+          @@ -1969,8 +2181,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -644,7 +699,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2438,21 @@
+          @@ -2261,3 +2480,21 @@
                    return result
                }
            }
@@ -924,17 +979,53 @@ jobs:
            import AVFoundation
            
            /// Voice command service with wake word detection
-          @@ -99,6 +100,49 @@
+          @@ -99,6 +100,85 @@
                // MARK: - Audio Engine
            
                private var audioEngine: AVAudioEngine?
+          +    private let microphoneRouter = MicrophoneInputRouter()
+          +    private(set) var isForwardingLiveAudio = false
+          +    var isMicrophoneRunning: Bool { audioEngine?.isRunning == true }
+          +
+          +    /// Switch consumers without stopping the foreground-started hardware engine.
+          +    func forwardMicrophoneToLive(_ sink: @escaping MicrophoneInputRouter.Sink) throws {
+          +        guard isListening, isMicrophoneRunning else { throw VoiceCommandError.audioEngineUnavailable }
+          +        isForwardingLiveAudio = true
+          +        recognitionGeneration += 1
+          +        recognitionTask?.cancel()
+          +        recognitionTask = nil
+          +        recognitionRequest?.endAudio()
+          +        recognitionRequest = nil
+          +        silenceTimer?.invalidate(); silenceTimer = nil
+          +        commandTimeoutTimer?.invalidate(); commandTimeoutTimer = nil
+          +        conversationTimeoutTimer?.invalidate(); conversationTimeoutTimer = nil
+          +        vadCommitPending = false
+          +        speechDetector.reset()
+          +        microphoneRouter.setSink(sink)
+          +        state = .processing
+          +    }
+          +
+          +    func pauseLiveMicrophoneDelivery() {
+          +        if isForwardingLiveAudio { microphoneRouter.setSink(nil) }
+          +    }
+          +
+          +    /// Return to Jarvis on the same engine and tap, including when the phone is locked.
+          +    func resumeWakeAfterLive() throws {
+          +        guard isListening, isMicrophoneRunning else { throw VoiceCommandError.audioEngineUnavailable }
+          +        isForwardingLiveAudio = false
+          +        currentTranscription = ""
+          +        hasSpokenThisTurn = false
+          +        state = isWakeWordEnabled ? .idle : .listening
+          +        restartRecognition()
+          +        guard recognitionTask != nil else { throw VoiceCommandError.requestCreationFailed }
+          +    }
           +    private var healthTimer: Timer?
           +    private var audioObservers: [NSObjectProtocol] = []
           +    private var audioInterrupted = false
           +
           +    /// Only recover an existing listener; never steal the live session's microphone.
           +    private func checkListenerHealth() {
-          +        guard isListening, !audioInterrupted else { return }
+          +        guard isListening, !audioInterrupted, !isForwardingLiveAudio else { return }
           +        let needsWake = (state == .idle && isWakeWordEnabled) || state == .conversationMode
           +        guard needsWake else { return }
           +        if audioEngine?.isRunning != true || recognitionRequest == nil || recognitionTask == nil {
@@ -974,7 +1065,7 @@ jobs:
            
                /// Throttle for the wake-word auto-restart. On some audio routes (notably the glasses'
                /// Bluetooth HFP mic) the recognizer finalizes immediately, and restarting with no delay
-          @@ -137,6 +181,7 @@
+          @@ -137,6 +217,7 @@
                private init() {
                    setupActivationSound()
                    setupSpeechDetector()
@@ -982,7 +1073,24 @@ jobs:
                }
            
                /// Wire VAD events and load the model. The model load is async and may fail (no assets, older
-          @@ -280,6 +325,11 @@
+          @@ -243,10 +324,14 @@
+                   // must not touch main-actor state. `feed` only converts + buffers, handing full chunks to
+                   // the detector's own consumer (see SpeechActivityDetector's threading note).
+                   let detector = speechDetector
+          +        microphoneRouter.setSink { buffer in
+          +            recognitionRequest.append(buffer)
+          +            detector.feed(buffer)
+          +        }
+          +        let router = microphoneRouter
+                   if let reason = OVCatchException({
+                       inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+          -                recognitionRequest.append(buffer)
+          -                detector.feed(buffer)
+          +                router.deliver(buffer)
+                       }
+                   }) {
+                       print("[VoiceCommand] installTap failed: \(reason)")
+          @@ -280,6 +365,11 @@
                    }
            
                    isListening = true
@@ -994,7 +1102,7 @@ jobs:
                    state = isWakeWordEnabled ? .idle : .listening
                    print("[VoiceCommand] Started listening - audio engine running")
                }
-          @@ -291,7 +341,9 @@
+          @@ -291,7 +381,9 @@
                private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
                    request.shouldReportPartialResults = true
                    request.taskHint = .search
@@ -1005,25 +1113,126 @@ jobs:
                    if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
                    request.contextualStrings = phrases
                }
-          @@ -328,7 +380,7 @@
+          @@ -328,7 +420,7 @@
                        // conversationMode → timeout → idle); both still need a live recognizer.
                        let stillNeedsRecognizer = (self.state == .idle && self.isWakeWordEnabled)
                            || self.state == .conversationMode
           -            guard self.isListening, stillNeedsRecognizer else { return }
-          +            guard self.isListening, stillNeedsRecognizer, !self.audioInterrupted else { return }
+          +            guard self.isListening, stillNeedsRecognizer, !self.audioInterrupted, !self.isForwardingLiveAudio else { return }
                        self.lastRecognizerRestart = Date()
                        self.restartRecognition()
                    }
-          @@ -336,6 +388,8 @@
+          @@ -336,6 +428,10 @@
            
                /// Stop listening
                func stopListening() {
+          +        microphoneRouter.setSink(nil)
+          +        isForwardingLiveAudio = false
           +        healthTimer?.invalidate()
           +        healthTimer = nil
                    recognitionGeneration += 1   // orphan any in-flight callbacks from the dying task
                    recognitionTask?.cancel()
                    recognitionTask = nil
-          @@ -539,7 +593,7 @@
+          @@ -383,7 +479,7 @@
+           
+               /// Restart speech recognition to clear buffer
+               private func restartRecognition() {
+          -        guard isListening else { return }
+          +        guard isListening, !isForwardingLiveAudio else { return }
+           
+                   // Stop current recognition. Bump the generation FIRST so the canceled task's dying
+                   // callbacks (delivered async) are orphaned immediately, not just once the new task exists.
+          @@ -393,8 +489,6 @@
+                   recognitionRequest?.endAudio()
+                   recognitionRequest = nil
+           
+          -        // Remove tap and stop engine briefly
+          -        audioEngine?.inputNode.removeTap(onBus: 0)
+           
+                   // Create new recognition request
+                   recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+          @@ -402,48 +496,40 @@
+           
+                   configureRecognitionRequest(recognitionRequest)
+           
+          -        // Reinstall tap
+          -        guard let audioEngine = audioEngine else { return }
+          -
+          -        // The glasses camera's Bluetooth route change can silently STOP the running engine (the
+          -        // recognizer then looks alive but hears nothing). Revive the same engine instead of tearing
+          -        // it down — a rebuild would force a fresh HFP/SCO negotiation the glasses can't service
+          -        // right after streaming, leaving the mic deaf. This mirrors OpenGlasses' persistent engine.
+          -        if !audioEngine.isRunning {
+          -            audioEngine.prepare()
+          -            do {
+          -                try audioEngine.start()
+          -                print("[VoiceCommand] Engine had stopped (route change) — restarted in place")
+          -            } catch {
+          -                print("[VoiceCommand] Engine restart failed: \(error)")
+          -            }
+          -        }
+          -
+          -        let inputNode = audioEngine.inputNode
+          -        inputNode.removeTap(onBus: 0) // defensive: never install over an existing tap
+          -        let recordingFormat = inputNode.outputFormat(forBus: 0)
+          -
+          -        // Skip if the mic is unavailable (e.g. on a call) — installing a tap with a
+          -        // 0 Hz / 0 channel format throws.
+          -        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+          -            print("[VoiceCommand] Input unavailable on reinstall — skipping tap")
+          -            self.recognitionRequest = nil
+          -            return
+          -        }
+          -
+          -        // Reinstall may follow a route change (phone mic <-> glasses HFP), so the detector's
+          -        // cached converter is built for the OLD format and would emit garbage — drop it.
+          +        guard let audioEngine else { return }
+                   speechDetector.reset()
+                   let detector = speechDetector
+          -        if let reason = OVCatchException({
+          -            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+          -                recognitionRequest.append(buffer)
+          -                detector.feed(buffer)
+          -            }
+          -        }) {
+          -            print("[VoiceCommand] installTap (reinstall) failed: \(reason)")
+          -            self.recognitionRequest = nil
+          -            return
+          +        microphoneRouter.setSink { buffer in
+          +            recognitionRequest.append(buffer)
+          +            detector.feed(buffer)
+          +        }
+          +        // Hardware route changes can stop the engine. Only that recovery path replaces
+          +        // the tap; normal wake/live/wake handoffs never touch the hardware.
+          +        if !audioEngine.isRunning {
+          +            let input = audioEngine.inputNode
+          +            input.removeTap(onBus: 0)
+          +            let format = input.outputFormat(forBus: 0)
+          +            guard format.sampleRate > 0, format.channelCount > 0 else {
+          +                microphoneRouter.setSink(nil)
+          +                self.recognitionRequest = nil
+          +                return
+          +            }
+          +            let router = microphoneRouter
+          +            if OVCatchException({
+          +                input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+          +                    router.deliver(buffer)
+          +                }
+          +            }) != nil {
+          +                microphoneRouter.setSink(nil)
+          +                self.recognitionRequest = nil
+          +                return
+          +            }
+          +            do { try audioEngine.start() }
+          +            catch {
+          +                microphoneRouter.setSink(nil)
+          +                self.recognitionRequest = nil
+          +                return
+          +            }
+                   }
+           
+                   // Start new recognition task
+          @@ -539,7 +625,7 @@
                    case .listening, .conversationMode:
                        // Strip wake word from transcription (like xmeta does)
                        var command = transcription
@@ -1032,7 +1241,7 @@ jobs:
                            if let range = command.lowercased().range(of: ww) {
                                command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
                                break
-          @@ -646,12 +700,7 @@
+          @@ -646,12 +732,7 @@
                /// word up front rejects those phantoms while still catching a real interrupt.
                private func wakeWordAtStart(_ text: String) -> Bool {
                    let lower = text.lowercased()
@@ -1046,7 +1255,7 @@ jobs:
                    for v in variations {
                        if let r = lower.range(of: v) {
                            // Characters of speech before the wake word. A little leeway ("uh, ok vision")
-          @@ -670,23 +719,7 @@
+          @@ -670,23 +751,7 @@
                    let wakeWordLower = wakeWord.lowercased()
            
                    // Check for exact match or common variations/misrecognitions
@@ -1071,7 +1280,7 @@ jobs:
            
                    let detected = variations.contains { lowercased.contains($0) }
                    if detected {
-          @@ -700,12 +733,7 @@
+          @@ -700,12 +765,7 @@
                    let lowercased = text.lowercased()
                    let wakeWordLower = wakeWord.lowercased()
            
@@ -1085,7 +1294,7 @@ jobs:
            
                    for variation in variations {
                        if let range = lowercased.range(of: variation) {
-          @@ -749,7 +777,7 @@
+          @@ -749,7 +809,7 @@
                    var command = text
                    let wakeWordLower = wakeWord.lowercased()
            
@@ -1096,7 +1305,39 @@ jobs:
                            break
           --- a/OpenVision/Services/Audio/AudioCaptureService.swift
           +++ b/OpenVision/Services/Audio/AudioCaptureService.swift
-          @@ -61,22 +61,30 @@
+          @@ -20,6 +20,31 @@
+           
+               private var audioEngine: AVAudioEngine?
+               private var inputNode: AVAudioInputNode?
+          +    private weak var sharedInput: VoiceCommandService?
+          +    private var sharedInputGeneration = 0
+          +
+          +    /// Reuse the wake listener's hardware input rather than start a second recording.
+          +    func startCapture(sharedInput source: VoiceCommandService) throws {
+          +        guard !isCapturing else { return }
+          +        sharedInputGeneration += 1
+          +        let generation = sharedInputGeneration
+          +        sharedInput = source
+          +        do {
+          +            try source.forwardMicrophoneToLive { [weak self] buffer in
+          +                let samples = MicrophoneInputRouter.monoSamples(from: buffer)
+          +                let rate = buffer.format.sampleRate
+          +                Task { @MainActor in
+          +                    guard let self, self.isCapturing,
+          +                          self.sharedInputGeneration == generation else { return }
+          +                    self.processMonoSamples(samples, sampleRate: rate)
+          +                }
+          +            }
+          +            isCapturing = true
+          +        } catch {
+          +            sharedInput = nil
+          +            throw error
+          +        }
+          +    }
+           
+               // MARK: - Audio Format
+           
+          @@ -61,29 +86,42 @@
            
                    // Get native format
                    let nativeFormat = inputNode.outputFormat(forBus: 0)
@@ -1131,9 +1372,100 @@ jobs:
                func stopCapture() {
           -        guard isCapturing else { return }
           -
+          +        sharedInputGeneration += 1
+          +        sharedInput?.pauseLiveMicrophoneDelivery()
+          +        sharedInput = nil
                    inputNode?.removeTap(onBus: 0)
                    audioEngine?.stop()
                    audioEngine = nil
+                   inputNode = nil
+           
+          -        // Flush remaining buffer
+          -        flushBuffer()
+          +        // Never send a previous microphone generation into a newly started session.
+          +        bufferLock.lock()
+          +        audioBuffer.removeAll()
+          +        bufferLock.unlock()
+           
+                   isCapturing = false
+                   print("[AudioCapture] Stopped capturing")
+          @@ -115,6 +153,12 @@
+                       }
+                   }
+           
+          +        processMonoSamples(monoSamples, sampleRate: nativeFormat.sampleRate)
+          +    }
+          +
+          +    private func processMonoSamples(_ monoSamples: [Float], sampleRate: Double) {
+          +        guard !monoSamples.isEmpty, sampleRate > 0 else { return }
+          +        let frameCount = monoSamples.count
+                   // Calculate audio level
+                   let rms = sqrt(monoSamples.map { $0 * $0 }.reduce(0, +) / Float(frameCount))
+                   Task { @MainActor in
+          @@ -123,8 +167,8 @@
+           
+                   // Resample if needed
+                   let resampledSamples: [Float]
+          -        if nativeFormat.sampleRate != targetSampleRate {
+          -            resampledSamples = resample(monoSamples, from: nativeFormat.sampleRate, to: targetSampleRate)
+          +        if sampleRate != targetSampleRate {
+          +            resampledSamples = resample(monoSamples, from: sampleRate, to: targetSampleRate)
+                   } else {
+                       resampledSamples = monoSamples
+                   }
+          @@ -142,7 +186,9 @@
+                       audioBuffer.removeFirst(targetBufferSize)
+                       bufferLock.unlock()
+           
+          +            let generation = sharedInputGeneration
+                       Task { @MainActor in
+          +                guard self.isCapturing, self.sharedInputGeneration == generation else { return }
+                           self.onAudioCaptured?(Data(chunk))
+                       }
+           
+          --- /dev/null
+          +++ b/OpenVision/Services/Audio/MicrophoneInputRouter.swift
+          @@ -0,0 +1,40 @@
+          +import AVFoundation
+          +import Foundation
+          +
+          +/// One hardware tap, with a replaceable consumer. Swapping wake/live consumers
+          +/// must not stop the microphone that was started while the app was foreground.
+          +final class MicrophoneInputRouter: @unchecked Sendable {
+          +    typealias Sink = (AVAudioPCMBuffer) -> Void
+          +    private let lock = NSLock()
+          +    private var sink: Sink?
+          +
+          +    func setSink(_ sink: Sink?) {
+          +        lock.lock()
+          +        self.sink = sink
+          +        lock.unlock()
+          +    }
+          +
+          +    func deliver(_ buffer: AVAudioPCMBuffer) {
+          +        lock.lock()
+          +        let current = sink
+          +        lock.unlock()
+          +        current?(buffer)
+          +    }
+          +
+          +    /// Copy samples before leaving the audio callback; AVAudioEngine reuses its buffer.
+          +    static func monoSamples(from buffer: AVAudioPCMBuffer) -> [Float] {
+          +        guard let channels = buffer.floatChannelData, buffer.frameLength > 0,
+          +              buffer.format.channelCount > 0 else { return [] }
+          +        let frames = Int(buffer.frameLength)
+          +        let count = Int(buffer.format.channelCount)
+          +        var result = [Float](repeating: 0, count: frames)
+          +        for channel in 0..<count {
+          +            for frame in 0..<frames {
+          +                let value = buffer.format.isInterleaved
+          +                    ? channels[0][frame * count + channel] : channels[channel][frame]
+          +                result[frame] += value / Float(count)
+          +            }
+          +        }
+          +        return result
+          +    }
+          +}
           --- a/OpenVision/Managers/SettingsManager.swift
           +++ b/OpenVision/Managers/SettingsManager.swift
           @@ -42,6 +42,13 @@
@@ -1223,7 +1555,7 @@ jobs:
           git apply <<'WAKE_PATCH'
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
-          @@ -50,6 +50,14 @@
+          @@ -50,6 +50,16 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
@@ -1235,10 +1567,12 @@ jobs:
           +    @Published var isContinuousLiveCamera = false
           +    private var snapshotTask: Task<Void, Never>?
           +    private var snapshotRequestedThisTurn = false
+          +    private var liveMicrophoneWatchdog: Timer?
+          +    private var lastLiveMicrophoneBufferAt = Date.distantPast
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -88,7 +96,7 @@
+          @@ -88,7 +98,7 @@
                        case .thinking: return "Thinking..."
                        case .speaking: return "Speaking..."
                        case .toolRunning: return "Running tool..."
@@ -1247,7 +1581,7 @@ jobs:
                        }
                    }
            
-          @@ -120,12 +128,19 @@
+          @@ -120,12 +130,19 @@
                }
            
                func onDisappear() {
@@ -1268,7 +1602,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +198,11 @@
+          @@ -183,6 +200,11 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -1280,7 +1614,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +274,7 @@
+          @@ -254,6 +276,7 @@
                }
            
                func startSession() {
@@ -1288,7 +1622,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +283,13 @@
+          @@ -262,6 +285,13 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -1302,7 +1636,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -382,11 +410,13 @@
+          @@ -382,11 +412,13 @@
                }
            
                func stopSession() {
@@ -1316,7 +1650,7 @@ jobs:
                    }
            
                    Task {
-          @@ -533,6 +563,7 @@
+          @@ -533,6 +565,7 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -1324,7 +1658,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -795,6 +826,7 @@
+          @@ -795,6 +828,7 @@
            
                /// Start listening for wake word
                private func startWakeWordListening() {
@@ -1332,7 +1666,7 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -970,13 +1002,16 @@
+          @@ -970,13 +1004,16 @@
                // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
@@ -1350,7 +1684,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,15 +1027,25 @@
+          @@ -992,15 +1029,25 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -1378,7 +1712,7 @@ jobs:
            
                    // Stop TTS if speaking
                    ttsService.stop()
-          @@ -1011,9 +1056,33 @@
+          @@ -1011,9 +1058,33 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -1413,7 +1747,7 @@ jobs:
                    }
            
                    // Connect to the live backend
-          @@ -1021,17 +1090,7 @@
+          @@ -1021,17 +1092,7 @@
                        try await service.connect()
                    } catch {
                        errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
@@ -1432,17 +1766,31 @@ jobs:
                        return
                    }
            
-          @@ -1043,11 +1102,18 @@
+          @@ -1039,42 +1100,66 @@
+                   setupLiveVideoCallbacks(service)
+           
+                   // Setup audio capture → live backend
+          -        audioCapture.onAudioCaptured = { [weak service] data in
+          +        audioCapture.onAudioCaptured = { [weak self, weak service] data in
+          +            guard let self, self.isLiveVideoMode else { return }
+          +            self.lastLiveMicrophoneBufferAt = Date()
                        service?.sendAudio(data: data)
                    }
            
-          +        // No await between ending the wake microphone and starting live capture.
-          +        voiceCommandService.stopListening()
+          +        // Preserve the already-running wake engine and its Bluetooth route while locked.
+          +        // Foreground camera use may have stopped it; only then prepare the route again.
+          +        if !voiceCommandService.isMicrophoneRunning {
+          +            voiceCommandService.stopListening()
+          +            applyPreferredAudioRoute()
+          +            do { try voiceCommandService.startListening() }
+          +            catch {
+          +                errorMessage = "Mikrofon hazır değil: \(error.localizedDescription). Voice ekranında yeniden dene."
+          +                await finishLiveSession()
+          +                return
+          +            }
+          +        }
                    // Setup audio playback
                    do {
-          +            // Match the route used by the working explicit-video path: camera
-          +            // streaming can make the glasses' HFP input unavailable.
-          +            applyPreferredAudioRoute()
                        try audioPlayback.setup()
                    } catch {
           -            print("[VoiceAgent] Failed to setup audio playback: \(error)")
@@ -1452,8 +1800,9 @@ jobs:
                    }
            
                    // Start audio capture
-          @@ -1055,26 +1121,24 @@
-                       try audioCapture.startCapture()
+                   do {
+          -            try audioCapture.startCapture()
+          +            try audioCapture.startCapture(sharedInput: voiceCommandService)
                    } catch {
                        errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
           -            await service.disconnect()
@@ -1481,6 +1830,16 @@ jobs:
                    isLiveVideoMode = true
           +        isSessionActive = true
                    agentState = .liveVideo
+          +        lastLiveMicrophoneBufferAt = Date()
+          +        liveMicrophoneWatchdog?.invalidate()
+          +        liveMicrophoneWatchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+          +            Task { @MainActor in
+          +                guard let self, self.isLiveVideoMode, !self.isCapturingSnapshot,
+          +                      Date().timeIntervalSince(self.lastLiveMicrophoneBufferAt) > 8 else { return }
+          +                self.errorMessage = "Mikrofon sesi kesildi. Telefonun kilidini açıp Voice ekranında yeniden dene."
+          +                await self.stopLiveVideoMode()
+          +            }
+          +        }
            
                    print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
            
@@ -1490,7 +1849,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1550,191 @@
+          @@ -1486,89 +1571,211 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -1521,11 +1880,13 @@ jobs:
           +            // Camera traffic can interrupt the glasses HFP route. Use the phone during
           +            // the short capture, then restore glasses audio after stopping the camera.
           +            self.audioCapture.stopCapture()
+          +            self.voiceCommandService.stopListening()
           +            self.audioPlayback.teardown()
           +            do {
           +                try AudioSessionManager.shared.configureForPhone()
           +                try self.audioPlayback.setup()
-          +                try self.audioCapture.startCapture()
+          +                try self.voiceCommandService.startListening()
+          +                try self.audioCapture.startCapture(sharedInput: self.voiceCommandService)
           +            } catch {
           +                self.errorMessage = "Kamera için ses bağlantısı hazırlanamadı."
           +                self.isCapturingSnapshot = false
@@ -1546,11 +1907,14 @@ jobs:
           +            if ownedStream { await self.glassesManager.stopStreaming() }
           +            guard !Task.isCancelled, self.isLiveVideoMode else { return }
           +            self.audioCapture.stopCapture()
+          +            self.voiceCommandService.stopListening()
           +            self.audioPlayback.teardown()
           +            self.applyPreferredAudioRoute()
           +            do {
           +                try self.audioPlayback.setup()
-          +                try self.audioCapture.startCapture()
+          +                try self.voiceCommandService.startListening()
+          +                try self.audioCapture.startCapture(sharedInput: self.voiceCommandService)
+          +                self.lastLiveMicrophoneBufferAt = Date()
           +                // Use the latest transcript; the request may have continued during capture.
           +                let fullQuestion = self.userTranscript.isEmpty ? question : self.userTranscript
           +                self.isCapturingSnapshot = false
@@ -1587,6 +1951,8 @@ jobs:
           +    private func finishLiveSession() async {
           +        let handoff = JarvisAudioHandoff(name: "Jarvis return to listening")
           +        defer { handoff.end() }
+          +        liveMicrophoneWatchdog?.invalidate()
+          +        liveMicrophoneWatchdog = nil
           +        // Clear state and callbacks BEFORE disconnect: the SDK can report its own
           +        // disconnect while we await it. It must not start a second teardown.
           +        isLiveVideoMode = false
@@ -1602,7 +1968,7 @@ jobs:
           -        print("[VoiceAgent] Stopping live video mode...")
           -
           -        // Stop audio capture
-          +        voiceCommandService.stopListening()
+          +        // Keep the shared hardware input alive until the wake recognizer takes it back.
           +        voiceCommandService.isBargeInPaused = false
           +
           +        snapshotTask?.cancel()
@@ -1676,9 +2042,22 @@ jobs:
           +        currentToolName = nil
           +        isVoiceReady = false
           +
-          +        guard settingsManager.settings.wakeWordEnabled else { return }
+          +        guard settingsManager.settings.wakeWordEnabled else {
+          +            voiceCommandService.stopListening()
+          +            return
+          +        }
+          +        if voiceCommandService.isMicrophoneRunning {
+          +            do {
+          +                try voiceCommandService.resumeWakeAfterLive()
+          +                isVoiceReady = true
+          +                return
+          +            } catch {
+          +                errorMessage = "Jarvis dinlemesine dönülemedi: \(error.localizedDescription)"
+          +            }
+          +        }
           +        // Let Bluetooth settle after camera shutdown. A failed microphone start
           +        // used to be logged only, leaving the app silently deaf until relaunched.
+          +        voiceCommandService.stopListening()
           +        for attempt in 0..<3 {
           +            if attempt > 0 {
           +                try? await Task.sleep(nanoseconds: 350_000_000)
@@ -1745,7 +2124,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1755,10 @@
+          @@ -1589,6 +1796,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -1756,7 +2135,15 @@ jobs:
                        }
                    }
            
-          @@ -1969,8 +2139,15 @@
+          @@ -1598,6 +1809,7 @@
+                           guard let self else { return }
+                           if self.isLiveVideoMode {
+                               print("[VoiceAgent] Live backend disconnected unexpectedly")
+          +                    self.errorMessage = "Canlı bağlantı kesildi. Voice ekranında yeniden dene."
+                               await self.stopLiveVideoMode()
+                           }
+                       }
+          @@ -1969,8 +2181,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -1774,7 +2161,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2438,21 @@
+          @@ -2261,3 +2480,21 @@
                    return result
                }
            }
@@ -2054,17 +2441,53 @@ jobs:
            import AVFoundation
            
            /// Voice command service with wake word detection
-          @@ -99,6 +100,49 @@
+          @@ -99,6 +100,85 @@
                // MARK: - Audio Engine
            
                private var audioEngine: AVAudioEngine?
+          +    private let microphoneRouter = MicrophoneInputRouter()
+          +    private(set) var isForwardingLiveAudio = false
+          +    var isMicrophoneRunning: Bool { audioEngine?.isRunning == true }
+          +
+          +    /// Switch consumers without stopping the foreground-started hardware engine.
+          +    func forwardMicrophoneToLive(_ sink: @escaping MicrophoneInputRouter.Sink) throws {
+          +        guard isListening, isMicrophoneRunning else { throw VoiceCommandError.audioEngineUnavailable }
+          +        isForwardingLiveAudio = true
+          +        recognitionGeneration += 1
+          +        recognitionTask?.cancel()
+          +        recognitionTask = nil
+          +        recognitionRequest?.endAudio()
+          +        recognitionRequest = nil
+          +        silenceTimer?.invalidate(); silenceTimer = nil
+          +        commandTimeoutTimer?.invalidate(); commandTimeoutTimer = nil
+          +        conversationTimeoutTimer?.invalidate(); conversationTimeoutTimer = nil
+          +        vadCommitPending = false
+          +        speechDetector.reset()
+          +        microphoneRouter.setSink(sink)
+          +        state = .processing
+          +    }
+          +
+          +    func pauseLiveMicrophoneDelivery() {
+          +        if isForwardingLiveAudio { microphoneRouter.setSink(nil) }
+          +    }
+          +
+          +    /// Return to Jarvis on the same engine and tap, including when the phone is locked.
+          +    func resumeWakeAfterLive() throws {
+          +        guard isListening, isMicrophoneRunning else { throw VoiceCommandError.audioEngineUnavailable }
+          +        isForwardingLiveAudio = false
+          +        currentTranscription = ""
+          +        hasSpokenThisTurn = false
+          +        state = isWakeWordEnabled ? .idle : .listening
+          +        restartRecognition()
+          +        guard recognitionTask != nil else { throw VoiceCommandError.requestCreationFailed }
+          +    }
           +    private var healthTimer: Timer?
           +    private var audioObservers: [NSObjectProtocol] = []
           +    private var audioInterrupted = false
           +
           +    /// Only recover an existing listener; never steal the live session's microphone.
           +    private func checkListenerHealth() {
-          +        guard isListening, !audioInterrupted else { return }
+          +        guard isListening, !audioInterrupted, !isForwardingLiveAudio else { return }
           +        let needsWake = (state == .idle && isWakeWordEnabled) || state == .conversationMode
           +        guard needsWake else { return }
           +        if audioEngine?.isRunning != true || recognitionRequest == nil || recognitionTask == nil {
@@ -2104,7 +2527,7 @@ jobs:
            
                /// Throttle for the wake-word auto-restart. On some audio routes (notably the glasses'
                /// Bluetooth HFP mic) the recognizer finalizes immediately, and restarting with no delay
-          @@ -137,6 +181,7 @@
+          @@ -137,6 +217,7 @@
                private init() {
                    setupActivationSound()
                    setupSpeechDetector()
@@ -2112,7 +2535,24 @@ jobs:
                }
            
                /// Wire VAD events and load the model. The model load is async and may fail (no assets, older
-          @@ -280,6 +325,11 @@
+          @@ -243,10 +324,14 @@
+                   // must not touch main-actor state. `feed` only converts + buffers, handing full chunks to
+                   // the detector's own consumer (see SpeechActivityDetector's threading note).
+                   let detector = speechDetector
+          +        microphoneRouter.setSink { buffer in
+          +            recognitionRequest.append(buffer)
+          +            detector.feed(buffer)
+          +        }
+          +        let router = microphoneRouter
+                   if let reason = OVCatchException({
+                       inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+          -                recognitionRequest.append(buffer)
+          -                detector.feed(buffer)
+          +                router.deliver(buffer)
+                       }
+                   }) {
+                       print("[VoiceCommand] installTap failed: \(reason)")
+          @@ -280,6 +365,11 @@
                    }
            
                    isListening = true
@@ -2124,7 +2564,7 @@ jobs:
                    state = isWakeWordEnabled ? .idle : .listening
                    print("[VoiceCommand] Started listening - audio engine running")
                }
-          @@ -291,7 +341,9 @@
+          @@ -291,7 +381,9 @@
                private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
                    request.shouldReportPartialResults = true
                    request.taskHint = .search
@@ -2135,25 +2575,126 @@ jobs:
                    if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
                    request.contextualStrings = phrases
                }
-          @@ -328,7 +380,7 @@
+          @@ -328,7 +420,7 @@
                        // conversationMode → timeout → idle); both still need a live recognizer.
                        let stillNeedsRecognizer = (self.state == .idle && self.isWakeWordEnabled)
                            || self.state == .conversationMode
           -            guard self.isListening, stillNeedsRecognizer else { return }
-          +            guard self.isListening, stillNeedsRecognizer, !self.audioInterrupted else { return }
+          +            guard self.isListening, stillNeedsRecognizer, !self.audioInterrupted, !self.isForwardingLiveAudio else { return }
                        self.lastRecognizerRestart = Date()
                        self.restartRecognition()
                    }
-          @@ -336,6 +388,8 @@
+          @@ -336,6 +428,10 @@
            
                /// Stop listening
                func stopListening() {
+          +        microphoneRouter.setSink(nil)
+          +        isForwardingLiveAudio = false
           +        healthTimer?.invalidate()
           +        healthTimer = nil
                    recognitionGeneration += 1   // orphan any in-flight callbacks from the dying task
                    recognitionTask?.cancel()
                    recognitionTask = nil
-          @@ -539,7 +593,7 @@
+          @@ -383,7 +479,7 @@
+           
+               /// Restart speech recognition to clear buffer
+               private func restartRecognition() {
+          -        guard isListening else { return }
+          +        guard isListening, !isForwardingLiveAudio else { return }
+           
+                   // Stop current recognition. Bump the generation FIRST so the canceled task's dying
+                   // callbacks (delivered async) are orphaned immediately, not just once the new task exists.
+          @@ -393,8 +489,6 @@
+                   recognitionRequest?.endAudio()
+                   recognitionRequest = nil
+           
+          -        // Remove tap and stop engine briefly
+          -        audioEngine?.inputNode.removeTap(onBus: 0)
+           
+                   // Create new recognition request
+                   recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+          @@ -402,48 +496,40 @@
+           
+                   configureRecognitionRequest(recognitionRequest)
+           
+          -        // Reinstall tap
+          -        guard let audioEngine = audioEngine else { return }
+          -
+          -        // The glasses camera's Bluetooth route change can silently STOP the running engine (the
+          -        // recognizer then looks alive but hears nothing). Revive the same engine instead of tearing
+          -        // it down — a rebuild would force a fresh HFP/SCO negotiation the glasses can't service
+          -        // right after streaming, leaving the mic deaf. This mirrors OpenGlasses' persistent engine.
+          -        if !audioEngine.isRunning {
+          -            audioEngine.prepare()
+          -            do {
+          -                try audioEngine.start()
+          -                print("[VoiceCommand] Engine had stopped (route change) — restarted in place")
+          -            } catch {
+          -                print("[VoiceCommand] Engine restart failed: \(error)")
+          -            }
+          -        }
+          -
+          -        let inputNode = audioEngine.inputNode
+          -        inputNode.removeTap(onBus: 0) // defensive: never install over an existing tap
+          -        let recordingFormat = inputNode.outputFormat(forBus: 0)
+          -
+          -        // Skip if the mic is unavailable (e.g. on a call) — installing a tap with a
+          -        // 0 Hz / 0 channel format throws.
+          -        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+          -            print("[VoiceCommand] Input unavailable on reinstall — skipping tap")
+          -            self.recognitionRequest = nil
+          -            return
+          -        }
+          -
+          -        // Reinstall may follow a route change (phone mic <-> glasses HFP), so the detector's
+          -        // cached converter is built for the OLD format and would emit garbage — drop it.
+          +        guard let audioEngine else { return }
+                   speechDetector.reset()
+                   let detector = speechDetector
+          -        if let reason = OVCatchException({
+          -            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+          -                recognitionRequest.append(buffer)
+          -                detector.feed(buffer)
+          -            }
+          -        }) {
+          -            print("[VoiceCommand] installTap (reinstall) failed: \(reason)")
+          -            self.recognitionRequest = nil
+          -            return
+          +        microphoneRouter.setSink { buffer in
+          +            recognitionRequest.append(buffer)
+          +            detector.feed(buffer)
+          +        }
+          +        // Hardware route changes can stop the engine. Only that recovery path replaces
+          +        // the tap; normal wake/live/wake handoffs never touch the hardware.
+          +        if !audioEngine.isRunning {
+          +            let input = audioEngine.inputNode
+          +            input.removeTap(onBus: 0)
+          +            let format = input.outputFormat(forBus: 0)
+          +            guard format.sampleRate > 0, format.channelCount > 0 else {
+          +                microphoneRouter.setSink(nil)
+          +                self.recognitionRequest = nil
+          +                return
+          +            }
+          +            let router = microphoneRouter
+          +            if OVCatchException({
+          +                input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+          +                    router.deliver(buffer)
+          +                }
+          +            }) != nil {
+          +                microphoneRouter.setSink(nil)
+          +                self.recognitionRequest = nil
+          +                return
+          +            }
+          +            do { try audioEngine.start() }
+          +            catch {
+          +                microphoneRouter.setSink(nil)
+          +                self.recognitionRequest = nil
+          +                return
+          +            }
+                   }
+           
+                   // Start new recognition task
+          @@ -539,7 +625,7 @@
                    case .listening, .conversationMode:
                        // Strip wake word from transcription (like xmeta does)
                        var command = transcription
@@ -2162,7 +2703,7 @@ jobs:
                            if let range = command.lowercased().range(of: ww) {
                                command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
                                break
-          @@ -646,12 +700,7 @@
+          @@ -646,12 +732,7 @@
                /// word up front rejects those phantoms while still catching a real interrupt.
                private func wakeWordAtStart(_ text: String) -> Bool {
                    let lower = text.lowercased()
@@ -2176,7 +2717,7 @@ jobs:
                    for v in variations {
                        if let r = lower.range(of: v) {
                            // Characters of speech before the wake word. A little leeway ("uh, ok vision")
-          @@ -670,23 +719,7 @@
+          @@ -670,23 +751,7 @@
                    let wakeWordLower = wakeWord.lowercased()
            
                    // Check for exact match or common variations/misrecognitions
@@ -2201,7 +2742,7 @@ jobs:
            
                    let detected = variations.contains { lowercased.contains($0) }
                    if detected {
-          @@ -700,12 +733,7 @@
+          @@ -700,12 +765,7 @@
                    let lowercased = text.lowercased()
                    let wakeWordLower = wakeWord.lowercased()
            
@@ -2215,7 +2756,7 @@ jobs:
            
                    for variation in variations {
                        if let range = lowercased.range(of: variation) {
-          @@ -749,7 +777,7 @@
+          @@ -749,7 +809,7 @@
                    var command = text
                    let wakeWordLower = wakeWord.lowercased()
            
@@ -2226,7 +2767,39 @@ jobs:
                            break
           --- a/OpenVision/Services/Audio/AudioCaptureService.swift
           +++ b/OpenVision/Services/Audio/AudioCaptureService.swift
-          @@ -61,22 +61,30 @@
+          @@ -20,6 +20,31 @@
+           
+               private var audioEngine: AVAudioEngine?
+               private var inputNode: AVAudioInputNode?
+          +    private weak var sharedInput: VoiceCommandService?
+          +    private var sharedInputGeneration = 0
+          +
+          +    /// Reuse the wake listener's hardware input rather than start a second recording.
+          +    func startCapture(sharedInput source: VoiceCommandService) throws {
+          +        guard !isCapturing else { return }
+          +        sharedInputGeneration += 1
+          +        let generation = sharedInputGeneration
+          +        sharedInput = source
+          +        do {
+          +            try source.forwardMicrophoneToLive { [weak self] buffer in
+          +                let samples = MicrophoneInputRouter.monoSamples(from: buffer)
+          +                let rate = buffer.format.sampleRate
+          +                Task { @MainActor in
+          +                    guard let self, self.isCapturing,
+          +                          self.sharedInputGeneration == generation else { return }
+          +                    self.processMonoSamples(samples, sampleRate: rate)
+          +                }
+          +            }
+          +            isCapturing = true
+          +        } catch {
+          +            sharedInput = nil
+          +            throw error
+          +        }
+          +    }
+           
+               // MARK: - Audio Format
+           
+          @@ -61,29 +86,42 @@
            
                    // Get native format
                    let nativeFormat = inputNode.outputFormat(forBus: 0)
@@ -2261,9 +2834,100 @@ jobs:
                func stopCapture() {
           -        guard isCapturing else { return }
           -
+          +        sharedInputGeneration += 1
+          +        sharedInput?.pauseLiveMicrophoneDelivery()
+          +        sharedInput = nil
                    inputNode?.removeTap(onBus: 0)
                    audioEngine?.stop()
                    audioEngine = nil
+                   inputNode = nil
+           
+          -        // Flush remaining buffer
+          -        flushBuffer()
+          +        // Never send a previous microphone generation into a newly started session.
+          +        bufferLock.lock()
+          +        audioBuffer.removeAll()
+          +        bufferLock.unlock()
+           
+                   isCapturing = false
+                   print("[AudioCapture] Stopped capturing")
+          @@ -115,6 +153,12 @@
+                       }
+                   }
+           
+          +        processMonoSamples(monoSamples, sampleRate: nativeFormat.sampleRate)
+          +    }
+          +
+          +    private func processMonoSamples(_ monoSamples: [Float], sampleRate: Double) {
+          +        guard !monoSamples.isEmpty, sampleRate > 0 else { return }
+          +        let frameCount = monoSamples.count
+                   // Calculate audio level
+                   let rms = sqrt(monoSamples.map { $0 * $0 }.reduce(0, +) / Float(frameCount))
+                   Task { @MainActor in
+          @@ -123,8 +167,8 @@
+           
+                   // Resample if needed
+                   let resampledSamples: [Float]
+          -        if nativeFormat.sampleRate != targetSampleRate {
+          -            resampledSamples = resample(monoSamples, from: nativeFormat.sampleRate, to: targetSampleRate)
+          +        if sampleRate != targetSampleRate {
+          +            resampledSamples = resample(monoSamples, from: sampleRate, to: targetSampleRate)
+                   } else {
+                       resampledSamples = monoSamples
+                   }
+          @@ -142,7 +186,9 @@
+                       audioBuffer.removeFirst(targetBufferSize)
+                       bufferLock.unlock()
+           
+          +            let generation = sharedInputGeneration
+                       Task { @MainActor in
+          +                guard self.isCapturing, self.sharedInputGeneration == generation else { return }
+                           self.onAudioCaptured?(Data(chunk))
+                       }
+           
+          --- /dev/null
+          +++ b/OpenVision/Services/Audio/MicrophoneInputRouter.swift
+          @@ -0,0 +1,40 @@
+          +import AVFoundation
+          +import Foundation
+          +
+          +/// One hardware tap, with a replaceable consumer. Swapping wake/live consumers
+          +/// must not stop the microphone that was started while the app was foreground.
+          +final class MicrophoneInputRouter: @unchecked Sendable {
+          +    typealias Sink = (AVAudioPCMBuffer) -> Void
+          +    private let lock = NSLock()
+          +    private var sink: Sink?
+          +
+          +    func setSink(_ sink: Sink?) {
+          +        lock.lock()
+          +        self.sink = sink
+          +        lock.unlock()
+          +    }
+          +
+          +    func deliver(_ buffer: AVAudioPCMBuffer) {
+          +        lock.lock()
+          +        let current = sink
+          +        lock.unlock()
+          +        current?(buffer)
+          +    }
+          +
+          +    /// Copy samples before leaving the audio callback; AVAudioEngine reuses its buffer.
+          +    static func monoSamples(from buffer: AVAudioPCMBuffer) -> [Float] {
+          +        guard let channels = buffer.floatChannelData, buffer.frameLength > 0,
+          +              buffer.format.channelCount > 0 else { return [] }
+          +        let frames = Int(buffer.frameLength)
+          +        let count = Int(buffer.format.channelCount)
+          +        var result = [Float](repeating: 0, count: frames)
+          +        for channel in 0..<count {
+          +            for frame in 0..<frames {
+          +                let value = buffer.format.isInterleaved
+          +                    ? channels[0][frame * count + channel] : channels[channel][frame]
+          +                result[frame] += value / Float(count)
+          +            }
+          +        }
+          +        return result
+          +    }
+          +}
           --- a/OpenVision/Managers/SettingsManager.swift
           +++ b/OpenVision/Managers/SettingsManager.swift
           @@ -42,6 +42,13 @@
@@ -2356,6 +3020,7 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Services/GeminiLive/GeminiLiveService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Voice/VoiceCommandService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/AudioCaptureService.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/Audio/MicrophoneInputRouter.swift
           xcrun swiftc -frontend -parse OpenVision/Managers/SettingsManager.swift
           xcrun swiftc -frontend -parse OpenVision/Models/AppSettings.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Voice/LiveStopCommand.swift
@@ -2413,6 +3078,50 @@ jobs:
           LIVE_TESTS
           xcrun swiftc -parse-as-library OpenVision/Services/Voice/LiveStopCommand.swift build/live-control-tests.swift -o build/live-control-tests
           ./build/live-control-tests
+          cat > build/microphone-router-tests.swift <<'MIC_TESTS'
+          import AVFoundation
+          import Foundation
+          
+          @main
+          struct MicrophoneRouterTests {
+              static func main() {
+                  let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 3)!
+                  buffer.frameLength = 3
+                  let data = buffer.floatChannelData!
+                  data[0][0] = 1; data[0][1] = -1; data[0][2] = 0.5
+                  data[1][0] = -1; data[1][1] = 1; data[1][2] = 0.5
+                  let samples = MicrophoneInputRouter.monoSamples(from: buffer)
+                  precondition(samples == [0, 0, 0.5])
+                  data[0][2] = 0
+                  precondition(samples[2] == 0.5, "Samples must survive native buffer reuse")
+          
+                  let router = MicrophoneInputRouter()
+                  var wakeFrames = 0
+                  var liveFrames = 0
+                  router.setSink { _ in wakeFrames += 1 }
+                  router.deliver(buffer)
+                  router.setSink { _ in liveFrames += 1 }
+                  router.deliver(buffer)
+                  precondition(wakeFrames == 1 && liveFrames == 1, "Exclusive wake/live routing")
+                  router.setSink(nil)
+                  router.deliver(buffer)
+                  precondition(wakeFrames == 1 && liveFrames == 1, "Pause must not forward audio")
+                  router.setSink { _ in
+                      wakeFrames += 1
+                      router.setSink(nil) // Reentrant teardown must not deadlock.
+                  }
+                  router.deliver(buffer)
+                  router.deliver(buffer)
+                  precondition(wakeFrames == 2 && liveFrames == 1)
+                  buffer.frameLength = 0
+                  precondition(MicrophoneInputRouter.monoSamples(from: buffer).isEmpty)
+                  print("PASS: one input routed wake/live/wake, pause, reentrant detach, copied stereo/empty samples")
+              }
+          }
+          MIC_TESTS
+          xcrun swiftc -parse-as-library OpenVision/Services/Audio/MicrophoneInputRouter.swift build/microphone-router-tests.swift -o build/microphone-router-tests
+          ./build/microphone-router-tests
 
       - name: iPhone uygulamasini imzasiz derle
         shell: bash
@@ -2432,7 +3141,7 @@ jobs:
             CODE_SIGN_IDENTITY= \
             CODE_SIGN_ENTITLEMENTS= \
             DEVELOPMENT_TEAM= \
-            CURRENT_PROJECT_VERSION=4 \
+            CURRENT_PROJECT_VERSION=5 \
             build 2>&1 | tee build/xcodebuild.log
 
       - name: Windows icin IPA dosyasini paketle
