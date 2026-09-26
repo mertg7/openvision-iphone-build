@@ -93,7 +93,7 @@ jobs:
           git apply --check <<'WAKE_PATCH'
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
-          @@ -50,6 +50,10 @@
+          @@ -50,6 +50,14 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
@@ -101,10 +101,32 @@ jobs:
           +    private var isChangingLiveMode = false
           +    private var liveStopCommand = LiveStopCommand()
           +    @Published var lastLiveFrameSentAt: Date = .distantPast
+          +    @Published var isCapturingSnapshot = false
+          +    @Published var isContinuousLiveCamera = false
+          +    private var snapshotTask: Task<Void, Never>?
+          +    private var snapshotRequestedThisTurn = false
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -126,6 +130,11 @@
+          @@ -88,7 +96,7 @@
+                       case .thinking: return "Thinking..."
+                       case .speaking: return "Speaking..."
+                       case .toolRunning: return "Running tool..."
+          -            case .liveVideo: return "Live Video"
+          +            case .liveVideo: return "Canlı sohbet"
+                       }
+                   }
+           
+          @@ -120,12 +128,19 @@
+               }
+           
+               func onDisappear() {
+          -        voiceCommandService.stopListening()
+          +        // Navigating to another tab may stop the idle listener; locking the phone must not.
+          +        guard UIApplication.shared.applicationState == .active else { return }
+          +        if !isLiveVideoMode { voiceCommandService.stopListening() }
+               }
+           
                // MARK: - Observed state changes (forwarded from the view's onChange hooks)
            
                func ttsSpeakingChanged(_ isSpeaking: Bool) {
@@ -116,7 +138,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +192,11 @@
+          @@ -183,6 +198,11 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -128,7 +150,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +268,7 @@
+          @@ -254,6 +274,7 @@
                }
            
                func startSession() {
@@ -136,7 +158,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +277,13 @@
+          @@ -262,6 +283,13 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -144,13 +166,13 @@ jobs:
           +        // Gemini replies are native audio. The live path owns capture, playback and
           +        // camera callbacks; the text-only startup never installed its audio callback.
           +        if settingsManager.settings.aiBackend == .geminiLive {
-          +            Task { await startLiveVideoMode() }
+          +            Task { await startLiveVideoMode(cameraEnabled: false) }
           +            return
           +        }
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -382,11 +404,13 @@
+          @@ -382,11 +410,13 @@
                }
            
                func stopSession() {
@@ -164,7 +186,7 @@ jobs:
                    }
            
                    Task {
-          @@ -533,6 +557,7 @@
+          @@ -533,6 +563,7 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -172,7 +194,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -795,6 +820,7 @@
+          @@ -795,6 +826,7 @@
            
                /// Start listening for wake word
                private func startWakeWordListening() {
@@ -180,10 +202,12 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -971,12 +997,15 @@
+          @@ -970,13 +1002,16 @@
+               // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
-               private func startLiveVideoMode() async {
+          -    private func startLiveVideoMode() async {
+          +    private func startLiveVideoMode(cameraEnabled: Bool = true) async {
           +        guard !isChangingLiveMode else { return }
                    guard !isLiveVideoMode else {
                        print("[VoiceAgent] Already in live video mode")
@@ -196,7 +220,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,9 +1021,14 @@
+          @@ -992,15 +1027,25 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -206,12 +230,25 @@ jobs:
                        return
                    }
           +        isChangingLiveMode = true
-          +        defer { isChangingLiveMode = false }
+          +        let handoff = JarvisAudioHandoff(name: "Jarvis audio handoff")
+          +        defer {
+          +            isChangingLiveMode = false
+          +            handoff.end()
+          +        }
+          +        isContinuousLiveCamera = cameraEnabled
           +        agentState = .connecting
                    activeLiveService = service
            
                    print("[VoiceAgent] Starting live video mode via \(label)...")
-          @@ -1011,9 +1045,28 @@
+           
+          -        // Stop VoiceCommandService - the live backend will handle audio directly
+          -        voiceCommandService.stopListening()
+          +        // Keep the wake microphone running during network setup. Stopping it before an
+          +        // awaited connection left no active audio while locked, allowing suspension.
+           
+                   // Stop TTS if speaking
+                   ttsService.stop()
+          @@ -1011,9 +1056,33 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -221,6 +258,7 @@ jobs:
           +        glassesManager.errorMessage = nil
           +        lastLiveFrameSentAt = .distantPast
           +        liveStopCommand.reset()
+          +        if cameraEnabled {
           +        let cameraStart = Date()
                    if !glassesManager.isStreaming {
                        await glassesManager.startStreaming()
@@ -238,10 +276,14 @@ jobs:
           +            await finishLiveSession()
           +            errorMessage = "Kamera açılamadı: \(reason) Gözlüğün bağlı ve takılı olduğunu kontrol et."
           +            return
+          +        }
+          +
+          +        } else if glassesManager.isStreaming && !isRecording {
+          +            await glassesManager.stopStreaming()
                    }
            
                    // Connect to the live backend
-          @@ -1021,17 +1074,7 @@
+          @@ -1021,17 +1090,7 @@
                        try await service.connect()
                    } catch {
                        errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
@@ -260,8 +302,12 @@ jobs:
                        return
                    }
            
-          @@ -1045,9 +1088,14 @@
+          @@ -1043,11 +1102,18 @@
+                       service?.sendAudio(data: data)
+                   }
            
+          +        // No await between ending the wake microphone and starting live capture.
+          +        voiceCommandService.stopListening()
                    // Setup audio playback
                    do {
           +            // Match the route used by the working explicit-video path: camera
@@ -276,7 +322,7 @@ jobs:
                    }
            
                    // Start audio capture
-          @@ -1055,26 +1103,24 @@
+          @@ -1055,26 +1121,24 @@
                        try audioCapture.startCapture()
                    } catch {
                        errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
@@ -297,7 +343,7 @@ jobs:
           +
           +        // This routing also survives onAppear (returning from Settings / camera permission).
           +        setupGlassesCallbacks()
-          +        if let frame = glassesManager.lastFrame,
+          +        if cameraEnabled, let frame = glassesManager.lastFrame,
           +           let jpeg = frame.jpegData(compressionQuality: 0.6) {
           +            service.sendVideoFrame(imageData: jpeg)
                    }
@@ -314,8 +360,85 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1488,86 +1534,101 @@
+          @@ -1486,89 +1550,189 @@
+                   return glassesManager.lastFrame   // fallback: better an old frame than nothing
+               }
            
+          +    /// Capture only on an explicit image request; never leave a temporary stream running.
+          +    func requestLiveSnapshot(question: String = "Ne görüyorsun?") {
+          +        guard isLiveVideoMode, activeLiveService === geminiLive,
+          +              !isChangingLiveMode, !isCapturingSnapshot else { return }
+          +        snapshotRequestedThisTurn = true
+          +        guard UIApplication.shared.applicationState == .active else {
+          +            errorMessage = "Görüntü almak için telefonun kilidini açıp Voice ekranına dön."
+          +            Task { try? await geminiLive.sendText("Kullanıcıya görüntü almak için telefonun kilidini açıp Voice ekranına dönmesini söyle. Kamera açılamadı; görüntü tahmin etme.") }
+          +            return
+          +        }
+          +        guard !isRecording else {
+          +            errorMessage = "Tek görüntü almak için önce video kaydını durdur."
+          +            return
+          +        }
+          +        snapshotRequestedThisTurn = true
+          +        isCapturingSnapshot = true
+          +        errorMessage = nil
+          +        audioPlayback.stop()
+          +        snapshotTask = Task { [weak self] in
+          +            guard let self else { return }
+          +            let started = Date()
+          +            let ownedStream = !self.glassesManager.isStreaming
+          +            // Camera traffic can interrupt the glasses HFP route. Use the phone during
+          +            // the short capture, then restore glasses audio after stopping the camera.
+          +            self.audioCapture.stopCapture()
+          +            self.audioPlayback.teardown()
+          +            do {
+          +                try AudioSessionManager.shared.configureForPhone()
+          +                try self.audioPlayback.setup()
+          +                try self.audioCapture.startCapture()
+          +            } catch {
+          +                self.errorMessage = "Kamera için ses bağlantısı hazırlanamadı."
+          +                self.isCapturingSnapshot = false
+          +                self.snapshotTask = nil
+          +                // Finish outside this task so teardown never awaits itself.
+          +                Task { await self.stopLiveVideoMode() }
+          +                return
+          +            }
+          +            if ownedStream { await self.glassesManager.startStreaming() }
+          +            let deadline = Date().addingTimeInterval(6)
+          +            while !Task.isCancelled, self.isLiveVideoMode, Date() < deadline,
+          +                  self.glassesManager.isStreaming,
+          +                  self.glassesManager.lastFrameTime < started {
+          +                try? await Task.sleep(nanoseconds: 100_000_000)
+          +            }
+          +            let jpeg = self.glassesManager.lastFrameTime >= started
+          +                ? self.glassesManager.lastFrame?.jpegData(compressionQuality: 0.7) : nil
+          +            if ownedStream { await self.glassesManager.stopStreaming() }
+          +            guard !Task.isCancelled, self.isLiveVideoMode else { return }
+          +            self.audioCapture.stopCapture()
+          +            self.audioPlayback.teardown()
+          +            self.applyPreferredAudioRoute()
+          +            do {
+          +                try self.audioPlayback.setup()
+          +                try self.audioCapture.startCapture()
+          +                // Use the latest transcript; the request may have continued during capture.
+          +                let fullQuestion = self.userTranscript.isEmpty ? question : self.userTranscript
+          +                self.isCapturingSnapshot = false
+          +                if let jpeg {
+          +                    try await self.geminiLive.sendSnapshot(jpeg, question: fullQuestion)
+          +                } else {
+          +                    self.errorMessage = "Gözlükten yeni görüntü alınamadı; kamera kapatıldı."
+          +                    try await self.geminiLive.sendText("Görüntü alınamadı. Bunu kullanıcıya Türkçe söyle; çevresini tahmin etme.")
+          +                }
+          +            } catch {
+          +                self.errorMessage = "Görüntü veya ses bağlantısı kurulamadı: \(error.localizedDescription)"
+          +                if !self.audioCapture.isCapturing {
+          +                    Task { await self.stopLiveVideoMode() }
+          +                }
+          +            }
+          +            self.isCapturingSnapshot = false
+          +            self.snapshotTask = nil
+          +        }
+          +    }
+          +
                /// Stop live video mode
                private func stopLiveVideoMode() async {
           -        guard isLiveVideoMode else {
@@ -330,6 +453,8 @@ jobs:
           +
           +    /// Called with the handoff guard held, including partial-start failures.
           +    private func finishLiveSession() async {
+          +        let handoff = JarvisAudioHandoff(name: "Jarvis return to listening")
+          +        defer { handoff.end() }
           +        // Clear state and callbacks BEFORE disconnect: the SDK can report its own
           +        // disconnect while we await it. It must not start a second teardown.
           +        isLiveVideoMode = false
@@ -348,6 +473,12 @@ jobs:
           +        voiceCommandService.stopListening()
           +        voiceCommandService.isBargeInPaused = false
           +
+          +        snapshotTask?.cancel()
+          +        await snapshotTask?.value
+          +        snapshotTask = nil
+          +        isCapturingSnapshot = false
+          +        isContinuousLiveCamera = false
+          +        snapshotRequestedThisTurn = false
           +        let service = activeLiveService
           +        activeLiveService = nil
           +        service?.onDisconnected = nil
@@ -441,7 +572,7 @@ jobs:
           +        if service === geminiLive {
           +            geminiLive.onInterrupted = { [weak self] in
           +                self?.audioPlayback.stop()
-          +                self?.liveStopCommand.reset()
+          +                // Do not clear a partially received stop phrase on server interruption.
           +            }
           +            geminiLive.onVideoFrameSent = { [weak self] in self?.lastLiveFrameSentAt = Date() }
           +            geminiLive.onVideoFrameError = { [weak self] in
@@ -450,7 +581,7 @@ jobs:
           +        }
                    service.onAudioReceived = { [weak self] data in
           -            self?.audioPlayback.playAudio(data: data)
-          +            guard let self, self.isLiveVideoMode else { return }
+          +            guard let self, self.isLiveVideoMode, !self.isCapturingSnapshot else { return }
           +            self.audioPlayback.playAudio(data: data)
                    }
            
@@ -477,17 +608,23 @@ jobs:
           +                if shouldStop {
           +                    self.audioPlayback.stop()
                                await self.stopLiveVideoMode()
+          +                } else if self.liveStopCommand.requestsImage, !self.snapshotRequestedThisTurn {
+          +                    self.requestLiveSnapshot(question: self.userTranscript)
                            }
                        }
-          @@ -1589,6 +1650,7 @@
+                   }
+          @@ -1589,6 +1753,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
-          +                self?.liveStopCommand.reset()
+          +                if self?.isCapturingSnapshot != true {
+          +                    self?.liveStopCommand.reset()
+          +                    self?.snapshotRequestedThisTurn = false
+          +                }
                        }
                    }
            
-          @@ -1969,8 +2031,14 @@
+          @@ -1969,8 +2137,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -495,6 +632,7 @@ jobs:
           -            self.geminiVision.sendVideoFrame(image)
           +            // Choose at delivery time: onAppear must not steal an active live stream.
           +            if let service = self.activeLiveService {
+          +                guard self.isContinuousLiveCamera else { return }
           +                if let jpeg = image.jpegData(compressionQuality: 0.6) {
           +                    service.sendVideoFrame(imageData: jpeg)
           +                }
@@ -504,6 +642,28 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
+          @@ -2261,3 +2436,21 @@
+                   return result
+               }
+           }
+          +
+          +/// Finite protection for audio ownership changes, not an always-on background workaround.
+          +@MainActor
+          +private final class JarvisAudioHandoff {
+          +    private var identifier = UIBackgroundTaskIdentifier.invalid
+          +
+          +    init(name: String) {
+          +        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+          +            self?.end()
+          +        }
+          +    }
+          +
+          +    func end() {
+          +        guard identifier != .invalid else { return }
+          +        UIApplication.shared.endBackgroundTask(identifier)
+          +        identifier = .invalid
+          +    }
+          +}
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
           @@ -72,6 +72,25 @@
@@ -532,7 +692,21 @@ jobs:
                        }
            
                        // Error overlay
-          @@ -217,7 +236,7 @@
+          @@ -123,11 +142,11 @@
+                                           .scaleEffect(1.5)
+                                   )
+           
+          -                    Text("LIVE")
+          +                    Text(glassesManager.isStreaming ? "KAMERA" : "CANLI SES")
+                                   .font(.caption.bold())
+                                   .foregroundColor(.white)
+           
+          -                    Image(systemName: "video.fill")
+          +                    Image(systemName: glassesManager.isStreaming ? "video.fill" : "waveform")
+                                   .font(.caption)
+                                   .foregroundColor(.white)
+                           }
+          @@ -217,13 +236,13 @@
                                    Text(settingsManager.settings.backendDisplayName)
                                        .font(.headline)
                                        .foregroundColor(Theme.heading)
@@ -541,13 +715,29 @@ jobs:
                                        .font(.caption)
                                        .foregroundColor(Theme.textSecondary)
                                }
-          @@ -244,8 +263,34 @@
+                           } else if viewModel.agentState == .idle && settingsManager.settings.wakeWordEnabled {
+                               VStack(spacing: 8) {
+          -                        Text("What can I see?")
+          +                        Text("Jarvis hazır")
+                                       .font(.system(size: 30, weight: .bold, design: .rounded))
+                                       .foregroundColor(Theme.heading)
+                                   if viewModel.isVoiceReady {
+          @@ -233,7 +252,7 @@
+                                   } else {
+                                       HStack(spacing: 8) {
+                                           ProgressView().tint(Theme.accent).scaleEffect(0.8)
+          -                                Text("Initializing voice…")
+          +                                Text("Seslenmen bekleniyor…")
+                                               .font(.subheadline)
+                                               .foregroundColor(Theme.textSecondary)
+                                       }
+          @@ -244,8 +263,43 @@
                        .transition(.opacity)
            
                        // The assistant identity: swirling emerald orb (tap to start/stop a session)
           -            SwirlOrb(mode: orbMode, size: 250)
           -                .onTapGesture { viewModel.toggleSession() }
-          +            if viewModel.isLiveVideoMode {
+          +            if viewModel.isLiveVideoMode && glassesManager.isStreaming {
           +                TimelineView(.periodic(from: .now, by: 1)) { context in
           +                    VStack(spacing: 6) {
           +                        if let frame = glassesManager.lastFrame,
@@ -574,6 +764,15 @@ jobs:
           +            } else {
           +                SwirlOrb(mode: orbMode, size: 250)
           +                    .onTapGesture { viewModel.toggleSession() }
+          +            }
+          +
+          +            if viewModel.isLiveVideoMode && settingsManager.settings.aiBackend == .geminiLive {
+          +                VStack(spacing: 8) {
+          +                    Text(viewModel.isCapturingSnapshot ? "Görüntü alınıyor…" : "Kamera yalnızca görüntü istediğinde açılır")
+          +                        .font(.caption).foregroundColor(Theme.textSecondary)
+          +                    Button("Ne görüyorsun?") { viewModel.requestLiveSnapshot() }
+          +                        .disabled(viewModel.isCapturingSnapshot)
+          +                }
           +            }
            
                        // Status text
@@ -607,7 +806,20 @@ jobs:
                    isModelSpeaking = false
                }
            
-          @@ -247,7 +251,8 @@
+          @@ -208,7 +212,11 @@
+               private func buildSystemPrompt() -> String {
+                   let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
+                   var prompt = """
+          -        You are a helpful AI assistant integrated with smart glasses. You can see what the user sees through their glasses camera.
+          +        You are Jarvis, a helpful voice assistant integrated with smart glasses. Reply in Turkish by default.
+          +        The camera is normally OFF. Never claim to see a current scene without a newly supplied image.
+          +        When the user says "Ne görüyorsun?", "Buna bak" or "Bunu oku", the app will briefly capture
+          +        and send an image with the question. Wait for that image before describing anything.
+          +        Previously supplied images are past snapshots, not a continuing live view.
+           
+                   Keep responses concise and conversational - the user is wearing glasses and expects quick, natural interactions.
+           
+          @@ -247,7 +255,8 @@
            
                /// Send audio data to Gemini
                func sendAudio(data: Data) {
@@ -617,7 +829,27 @@ jobs:
            
                    let message: [String: Any] = [
                        "realtimeInput": [
-          @@ -320,8 +325,16 @@
+          @@ -291,6 +300,19 @@
+                   try await sendJSON(message)
+               }
+           
+          +    /// Keep the question and its single fresh image together in one ordered user turn.
+          +    func sendSnapshot(_ jpeg: Data, question: String) async throws {
+          +        guard connectionState.isUsable else { throw AIBackendError.notConnected }
+          +        let parts: [[String: Any]] = [
+          +            ["inlineData": ["mimeType": "image/jpeg", "data": jpeg.base64EncodedString()]],
+          +            ["text": "Bu yeni çekilen görüntüye bakarak Türkçe yanıtla: \(question)"]
+          +        ]
+          +        try await sendJSON(["clientContent": [
+          +            "turns": [["role": "user", "parts": parts]], "turnComplete": true
+          +        ]])
+          +        onVideoFrameSent?()
+          +    }
+          +
+               /// Interrupt the AI (barge-in support)
+               func interrupt() async {
+                   // Send interrupt signal if model is speaking
+          @@ -320,8 +342,16 @@
                        ]
                    ]
            
@@ -635,7 +867,7 @@ jobs:
                    }
                }
            
-          @@ -411,23 +424,16 @@
+          @@ -411,23 +441,16 @@
            
                /// Handle server content
                private func handleServerContent(_ content: [String: Any]) {
@@ -664,7 +896,7 @@ jobs:
                       let parts = modelTurn["parts"] as? [[String: Any]] {
            
                        for part in parts {
-          @@ -459,6 +465,15 @@
+          @@ -459,6 +482,15 @@
                    if let inputTranscription = content["inputTranscription"] as? [String: Any],
                       let text = inputTranscription["text"] as? String {
                        onInputTranscription?(text)
@@ -680,9 +912,256 @@ jobs:
                    }
                }
            
+          --- a/OpenVision/Services/Voice/VoiceCommandService.swift
+          +++ b/OpenVision/Services/Voice/VoiceCommandService.swift
+          @@ -3,6 +3,7 @@
+           
+           import Foundation
+           import Speech
+          +import UIKit
+           import AVFoundation
+           
+           /// Voice command service with wake word detection
+          @@ -99,6 +100,49 @@
+               // MARK: - Audio Engine
+           
+               private var audioEngine: AVAudioEngine?
+          +    private var healthTimer: Timer?
+          +    private var audioObservers: [NSObjectProtocol] = []
+          +    private var audioInterrupted = false
+          +
+          +    /// Only recover an existing listener; never steal the live session's microphone.
+          +    private func checkListenerHealth() {
+          +        guard isListening, !audioInterrupted else { return }
+          +        let needsWake = (state == .idle && isWakeWordEnabled) || state == .conversationMode
+          +        guard needsWake else { return }
+          +        if audioEngine?.isRunning != true || recognitionRequest == nil || recognitionTask == nil {
+          +            try? AVAudioSession.sharedInstance().setActive(true)
+          +            scheduleWakeWordRestart()
+          +        }
+          +    }
+          +
+          +    private func observeAudioLifecycle() {
+          +        let center = NotificationCenter.default
+          +        for name in [AVAudioSession.routeChangeNotification,
+          +                     Notification.Name.AVAudioEngineConfigurationChange,
+          +                     UIApplication.didBecomeActiveNotification] {
+          +            audioObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+          +                Task { @MainActor in self?.checkListenerHealth() }
+          +            })
+          +        }
+          +        audioObservers.append(center.addObserver(forName: AVAudioSession.interruptionNotification,
+          +                                                  object: nil, queue: .main) { [weak self] note in
+          +            let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+          +            let options = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+          +            Task { @MainActor in
+          +                guard let self else { return }
+          +                if type == AVAudioSession.InterruptionType.began.rawValue {
+          +                    self.audioInterrupted = true
+          +                } else if type == AVAudioSession.InterruptionType.ended.rawValue {
+          +                    let mayResume = AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
+          +                    self.audioInterrupted = !mayResume
+          +                    if mayResume, self.isListening {
+          +                        try? AVAudioSession.sharedInstance().setActive(true)
+          +                        self.scheduleWakeWordRestart()
+          +                    }
+          +                }
+          +            }
+          +        })
+          +    }
+           
+               /// Throttle for the wake-word auto-restart. On some audio routes (notably the glasses'
+               /// Bluetooth HFP mic) the recognizer finalizes immediately, and restarting with no delay
+          @@ -137,6 +181,7 @@
+               private init() {
+                   setupActivationSound()
+                   setupSpeechDetector()
+          +        observeAudioLifecycle()
+               }
+           
+               /// Wire VAD events and load the model. The model load is async and may fail (no assets, older
+          @@ -280,6 +325,11 @@
+                   }
+           
+                   isListening = true
+          +        audioInterrupted = false
+          +        healthTimer?.invalidate()
+          +        healthTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+          +            Task { @MainActor in self?.checkListenerHealth() }
+          +        }
+                   state = isWakeWordEnabled ? .idle : .listening
+                   print("[VoiceCommand] Started listening - audio engine running")
+               }
+          @@ -291,7 +341,9 @@
+               private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
+                   request.shouldReportPartialResults = true
+                   request.taskHint = .search
+          -        var phrases = ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
+          +        // Avoid the network recognizer for the wake word when the local English model is available.
+          +        request.requiresOnDeviceRecognition = speechRecognizer?.supportsOnDeviceRecognition == true
+          +        var phrases = ["Jarvis", "Hey Jarvis"]
+                   if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
+                   request.contextualStrings = phrases
+               }
+          @@ -328,7 +380,7 @@
+                       // conversationMode → timeout → idle); both still need a live recognizer.
+                       let stillNeedsRecognizer = (self.state == .idle && self.isWakeWordEnabled)
+                           || self.state == .conversationMode
+          -            guard self.isListening, stillNeedsRecognizer else { return }
+          +            guard self.isListening, stillNeedsRecognizer, !self.audioInterrupted else { return }
+                       self.lastRecognizerRestart = Date()
+                       self.restartRecognition()
+                   }
+          @@ -336,6 +388,8 @@
+           
+               /// Stop listening
+               func stopListening() {
+          +        healthTimer?.invalidate()
+          +        healthTimer = nil
+                   recognitionGeneration += 1   // orphan any in-flight callbacks from the dying task
+                   recognitionTask?.cancel()
+                   recognitionTask = nil
+          @@ -539,7 +593,7 @@
+                   case .listening, .conversationMode:
+                       // Strip wake word from transcription (like xmeta does)
+                       var command = transcription
+          -            for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision"] {
+          +            for ww in [wakeWord.lowercased()] {
+                           if let range = command.lowercased().range(of: ww) {
+                               command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                               break
+          @@ -646,12 +700,7 @@
+               /// word up front rejects those phantoms while still catching a real interrupt.
+               private func wakeWordAtStart(_ text: String) -> Bool {
+                   let lower = text.lowercased()
+          -        let variations = [
+          -            wakeWord.lowercased(),
+          -            "ok vision", "okay vision", "o.k. vision", "o k vision",
+          -            "hey vision", "hi vision",
+          -            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+          -        ]
+          +        let variations = [wakeWord.lowercased()]
+                   for v in variations {
+                       if let r = lower.range(of: v) {
+                           // Characters of speech before the wake word. A little leeway ("uh, ok vision")
+          @@ -670,23 +719,7 @@
+                   let wakeWordLower = wakeWord.lowercased()
+           
+                   // Check for exact match or common variations/misrecognitions
+          -        let variations = [
+          -            wakeWordLower,
+          -            // OK Vision variants (most reliable)
+          -            "ok vision",
+          -            "okay vision",
+          -            "o.k. vision",
+          -            "o k vision",
+          -            // Ok Vision variants
+          -            "hey vision",
+          -            "hi vision",
+          -            // Common misrecognitions
+          -            "a vision",
+          -            "heavy vision",
+          -            "have vision",
+          -            "obey vision",
+          -            "oak vision"
+          -        ]
+          +        let variations = [wakeWordLower]
+           
+                   let detected = variations.contains { lowercased.contains($0) }
+                   if detected {
+          @@ -700,12 +733,7 @@
+                   let lowercased = text.lowercased()
+                   let wakeWordLower = wakeWord.lowercased()
+           
+          -        let variations = [
+          -            wakeWordLower,
+          -            "ok vision", "okay vision", "o.k. vision", "o k vision",
+          -            "hey vision", "hi vision",
+          -            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+          -        ]
+          +        let variations = [wakeWordLower]
+           
+                   for variation in variations {
+                       if let range = lowercased.range(of: variation) {
+          @@ -749,7 +777,7 @@
+                   var command = text
+                   let wakeWordLower = wakeWord.lowercased()
+           
+          -        for prefix in [wakeWordLower, "hey vision", "ok vision", "okay vision"] {
+          +        for prefix in [wakeWordLower] {
+                       if command.lowercased().hasPrefix(prefix) {
+                           command = String(command.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+                           break
+          --- a/OpenVision/Services/Audio/AudioCaptureService.swift
+          +++ b/OpenVision/Services/Audio/AudioCaptureService.swift
+          @@ -61,22 +61,30 @@
+           
+                   // Get native format
+                   let nativeFormat = inputNode.outputFormat(forBus: 0)
+          +        guard nativeFormat.sampleRate > 0, nativeFormat.channelCount > 0 else {
+          +            stopCapture()
+          +            throw AudioCaptureError.inputNodeUnavailable
+          +        }
+                   print("[AudioCapture] Native format: \(nativeFormat)")
+           
+                   // Install tap in native format
+          -        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nativeFormat) { [weak self] buffer, _ in
+          -            self?.processAudioBuffer(buffer, nativeFormat: nativeFormat)
+          -        }
+          -
+          -        try engine.start()
+          +        if OVCatchException({
+          +            inputNode.installTap(onBus: 0, bufferSize: 1024, format: nativeFormat) { [weak self] buffer, _ in
+          +                self?.processAudioBuffer(buffer, nativeFormat: nativeFormat)
+          +            }
+          +        }) != nil {
+          +            stopCapture()
+          +            throw AudioCaptureError.inputNodeUnavailable
+          +        }
+          +
+          +        do { try engine.start() }
+          +        catch { stopCapture(); throw error }
+                   isCapturing = true
+                   print("[AudioCapture] Started capturing")
+               }
+           
+               /// Stop capturing audio
+               func stopCapture() {
+          -        guard isCapturing else { return }
+          -
+                   inputNode?.removeTap(onBus: 0)
+                   audioEngine?.stop()
+                   audioEngine = nil
+          --- a/OpenVision/Managers/SettingsManager.swift
+          +++ b/OpenVision/Managers/SettingsManager.swift
+          @@ -42,6 +42,13 @@
+           
+                   // Load existing settings or create defaults
+                   settings = Self.loadSettings(from: settingsURL)
+          +
+          +        // Apply the requested rename once, including installations with saved preferences.
+          +        if !UserDefaults.standard.bool(forKey: "jarvisWakeMigrationV4") {
+          +            settings.wakeWord = "Jarvis"
+          +            performSave()
+          +            UserDefaults.standard.set(true, forKey: "jarvisWakeMigrationV4")
+          +        }
+           
+                   print("[SettingsManager] Initialized with settings from: \(settingsURL.path)")
+               }
+          --- a/OpenVision/Models/AppSettings.swift
+          +++ b/OpenVision/Models/AppSettings.swift
+          @@ -117,7 +117,7 @@
+               // MARK: - Voice Settings
+           
+               /// Wake word phrase (default: "Ok Vision")
+          -    var wakeWord: String = "Ok Vision"
+          +    var wakeWord: String = "Jarvis"
+           
+               /// Whether wake word detection is enabled (OpenClaw mode only)
+               var wakeWordEnabled: Bool = true
           --- /dev/null
           +++ b/OpenVision/Services/Voice/LiveStopCommand.swift
-          @@ -0,0 +1,38 @@
+          @@ -0,0 +1,55 @@
           +import Foundation
           +
           +/// Live transcripts may arrive as word fragments or as a cumulative utterance.
@@ -712,6 +1191,11 @@ jobs:
           +            .filter { !$0.isEmpty }.joined(separator: " ")
           +        let exact = ["dur", "dur dur", "lutfen dur", "dur lutfen", "sus", "yeter",
           +                     "stop", "stop please", "please stop"]
+          +        // Background speech can precede/follow the command. Match a whole word,
+          +        // never the beginnings of "durum", "durak" or "durdurma".
+          +        let chunkWords = text.lowercased(with: Locale(identifier: "tr_TR"))
+          +            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+          +        if normalized.split(separator: " ").contains("dur") || chunkWords.contains("dur") { return true }
           +        if exact.contains(normalized) { return true }
           +        let phrases = ["konusmayi durdur", "konusmayi bitir", "sohbeti bitir",
           +                       "videoyu durdur", "kamerayi kapat", "dinlemeyi durdur",
@@ -720,12 +1204,24 @@ jobs:
           +                       "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
           +        return phrases.contains { (" " + normalized + " ").contains(" " + $0 + " ") }
           +    }
+          +
+          +    var requestsImage: Bool {
+          +        let normalized = transcript.lowercased(with: Locale(identifier: "tr_TR"))
+          +            .folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US"))
+          +            .replacingOccurrences(of: "ı", with: "i")
+          +            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+          +            .filter { !$0.isEmpty }.joined(separator: " ")
+          +        let phrases = ["ne goruyorsun", "ne gordugunu soyle", "buna bak", "suna bak",
+          +                       "onumde ne var", "bunu oku", "su yaziyi oku", "kameradan bak",
+          +                       "what do you see", "what can you see", "look at this", "read this"]
+          +        return phrases.contains { (" " + normalized + " ").contains(" " + $0 + " ") }
+          +    }
           +}
           WAKE_PATCH
           git apply <<'WAKE_PATCH'
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
-          @@ -50,6 +50,10 @@
+          @@ -50,6 +50,14 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
@@ -733,10 +1229,32 @@ jobs:
           +    private var isChangingLiveMode = false
           +    private var liveStopCommand = LiveStopCommand()
           +    @Published var lastLiveFrameSentAt: Date = .distantPast
+          +    @Published var isCapturingSnapshot = false
+          +    @Published var isContinuousLiveCamera = false
+          +    private var snapshotTask: Task<Void, Never>?
+          +    private var snapshotRequestedThisTurn = false
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -126,6 +130,11 @@
+          @@ -88,7 +96,7 @@
+                       case .thinking: return "Thinking..."
+                       case .speaking: return "Speaking..."
+                       case .toolRunning: return "Running tool..."
+          -            case .liveVideo: return "Live Video"
+          +            case .liveVideo: return "Canlı sohbet"
+                       }
+                   }
+           
+          @@ -120,12 +128,19 @@
+               }
+           
+               func onDisappear() {
+          -        voiceCommandService.stopListening()
+          +        // Navigating to another tab may stop the idle listener; locking the phone must not.
+          +        guard UIApplication.shared.applicationState == .active else { return }
+          +        if !isLiveVideoMode { voiceCommandService.stopListening() }
+               }
+           
                // MARK: - Observed state changes (forwarded from the view's onChange hooks)
            
                func ttsSpeakingChanged(_ isSpeaking: Bool) {
@@ -748,7 +1266,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +192,11 @@
+          @@ -183,6 +198,11 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -760,7 +1278,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +268,7 @@
+          @@ -254,6 +274,7 @@
                }
            
                func startSession() {
@@ -768,7 +1286,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +277,13 @@
+          @@ -262,6 +283,13 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -776,13 +1294,13 @@ jobs:
           +        // Gemini replies are native audio. The live path owns capture, playback and
           +        // camera callbacks; the text-only startup never installed its audio callback.
           +        if settingsManager.settings.aiBackend == .geminiLive {
-          +            Task { await startLiveVideoMode() }
+          +            Task { await startLiveVideoMode(cameraEnabled: false) }
           +            return
           +        }
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -382,11 +404,13 @@
+          @@ -382,11 +410,13 @@
                }
            
                func stopSession() {
@@ -796,7 +1314,7 @@ jobs:
                    }
            
                    Task {
-          @@ -533,6 +557,7 @@
+          @@ -533,6 +563,7 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -804,7 +1322,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -795,6 +820,7 @@
+          @@ -795,6 +826,7 @@
            
                /// Start listening for wake word
                private func startWakeWordListening() {
@@ -812,10 +1330,12 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -971,12 +997,15 @@
+          @@ -970,13 +1002,16 @@
+               // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
-               private func startLiveVideoMode() async {
+          -    private func startLiveVideoMode() async {
+          +    private func startLiveVideoMode(cameraEnabled: Bool = true) async {
           +        guard !isChangingLiveMode else { return }
                    guard !isLiveVideoMode else {
                        print("[VoiceAgent] Already in live video mode")
@@ -828,7 +1348,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,9 +1021,14 @@
+          @@ -992,15 +1027,25 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -838,12 +1358,25 @@ jobs:
                        return
                    }
           +        isChangingLiveMode = true
-          +        defer { isChangingLiveMode = false }
+          +        let handoff = JarvisAudioHandoff(name: "Jarvis audio handoff")
+          +        defer {
+          +            isChangingLiveMode = false
+          +            handoff.end()
+          +        }
+          +        isContinuousLiveCamera = cameraEnabled
           +        agentState = .connecting
                    activeLiveService = service
            
                    print("[VoiceAgent] Starting live video mode via \(label)...")
-          @@ -1011,9 +1045,28 @@
+           
+          -        // Stop VoiceCommandService - the live backend will handle audio directly
+          -        voiceCommandService.stopListening()
+          +        // Keep the wake microphone running during network setup. Stopping it before an
+          +        // awaited connection left no active audio while locked, allowing suspension.
+           
+                   // Stop TTS if speaking
+                   ttsService.stop()
+          @@ -1011,9 +1056,33 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -853,6 +1386,7 @@ jobs:
           +        glassesManager.errorMessage = nil
           +        lastLiveFrameSentAt = .distantPast
           +        liveStopCommand.reset()
+          +        if cameraEnabled {
           +        let cameraStart = Date()
                    if !glassesManager.isStreaming {
                        await glassesManager.startStreaming()
@@ -870,10 +1404,14 @@ jobs:
           +            await finishLiveSession()
           +            errorMessage = "Kamera açılamadı: \(reason) Gözlüğün bağlı ve takılı olduğunu kontrol et."
           +            return
+          +        }
+          +
+          +        } else if glassesManager.isStreaming && !isRecording {
+          +            await glassesManager.stopStreaming()
                    }
            
                    // Connect to the live backend
-          @@ -1021,17 +1074,7 @@
+          @@ -1021,17 +1090,7 @@
                        try await service.connect()
                    } catch {
                        errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
@@ -892,8 +1430,12 @@ jobs:
                        return
                    }
            
-          @@ -1045,9 +1088,14 @@
+          @@ -1043,11 +1102,18 @@
+                       service?.sendAudio(data: data)
+                   }
            
+          +        // No await between ending the wake microphone and starting live capture.
+          +        voiceCommandService.stopListening()
                    // Setup audio playback
                    do {
           +            // Match the route used by the working explicit-video path: camera
@@ -908,7 +1450,7 @@ jobs:
                    }
            
                    // Start audio capture
-          @@ -1055,26 +1103,24 @@
+          @@ -1055,26 +1121,24 @@
                        try audioCapture.startCapture()
                    } catch {
                        errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
@@ -929,7 +1471,7 @@ jobs:
           +
           +        // This routing also survives onAppear (returning from Settings / camera permission).
           +        setupGlassesCallbacks()
-          +        if let frame = glassesManager.lastFrame,
+          +        if cameraEnabled, let frame = glassesManager.lastFrame,
           +           let jpeg = frame.jpegData(compressionQuality: 0.6) {
           +            service.sendVideoFrame(imageData: jpeg)
                    }
@@ -946,8 +1488,85 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1488,86 +1534,101 @@
+          @@ -1486,89 +1550,189 @@
+                   return glassesManager.lastFrame   // fallback: better an old frame than nothing
+               }
            
+          +    /// Capture only on an explicit image request; never leave a temporary stream running.
+          +    func requestLiveSnapshot(question: String = "Ne görüyorsun?") {
+          +        guard isLiveVideoMode, activeLiveService === geminiLive,
+          +              !isChangingLiveMode, !isCapturingSnapshot else { return }
+          +        snapshotRequestedThisTurn = true
+          +        guard UIApplication.shared.applicationState == .active else {
+          +            errorMessage = "Görüntü almak için telefonun kilidini açıp Voice ekranına dön."
+          +            Task { try? await geminiLive.sendText("Kullanıcıya görüntü almak için telefonun kilidini açıp Voice ekranına dönmesini söyle. Kamera açılamadı; görüntü tahmin etme.") }
+          +            return
+          +        }
+          +        guard !isRecording else {
+          +            errorMessage = "Tek görüntü almak için önce video kaydını durdur."
+          +            return
+          +        }
+          +        snapshotRequestedThisTurn = true
+          +        isCapturingSnapshot = true
+          +        errorMessage = nil
+          +        audioPlayback.stop()
+          +        snapshotTask = Task { [weak self] in
+          +            guard let self else { return }
+          +            let started = Date()
+          +            let ownedStream = !self.glassesManager.isStreaming
+          +            // Camera traffic can interrupt the glasses HFP route. Use the phone during
+          +            // the short capture, then restore glasses audio after stopping the camera.
+          +            self.audioCapture.stopCapture()
+          +            self.audioPlayback.teardown()
+          +            do {
+          +                try AudioSessionManager.shared.configureForPhone()
+          +                try self.audioPlayback.setup()
+          +                try self.audioCapture.startCapture()
+          +            } catch {
+          +                self.errorMessage = "Kamera için ses bağlantısı hazırlanamadı."
+          +                self.isCapturingSnapshot = false
+          +                self.snapshotTask = nil
+          +                // Finish outside this task so teardown never awaits itself.
+          +                Task { await self.stopLiveVideoMode() }
+          +                return
+          +            }
+          +            if ownedStream { await self.glassesManager.startStreaming() }
+          +            let deadline = Date().addingTimeInterval(6)
+          +            while !Task.isCancelled, self.isLiveVideoMode, Date() < deadline,
+          +                  self.glassesManager.isStreaming,
+          +                  self.glassesManager.lastFrameTime < started {
+          +                try? await Task.sleep(nanoseconds: 100_000_000)
+          +            }
+          +            let jpeg = self.glassesManager.lastFrameTime >= started
+          +                ? self.glassesManager.lastFrame?.jpegData(compressionQuality: 0.7) : nil
+          +            if ownedStream { await self.glassesManager.stopStreaming() }
+          +            guard !Task.isCancelled, self.isLiveVideoMode else { return }
+          +            self.audioCapture.stopCapture()
+          +            self.audioPlayback.teardown()
+          +            self.applyPreferredAudioRoute()
+          +            do {
+          +                try self.audioPlayback.setup()
+          +                try self.audioCapture.startCapture()
+          +                // Use the latest transcript; the request may have continued during capture.
+          +                let fullQuestion = self.userTranscript.isEmpty ? question : self.userTranscript
+          +                self.isCapturingSnapshot = false
+          +                if let jpeg {
+          +                    try await self.geminiLive.sendSnapshot(jpeg, question: fullQuestion)
+          +                } else {
+          +                    self.errorMessage = "Gözlükten yeni görüntü alınamadı; kamera kapatıldı."
+          +                    try await self.geminiLive.sendText("Görüntü alınamadı. Bunu kullanıcıya Türkçe söyle; çevresini tahmin etme.")
+          +                }
+          +            } catch {
+          +                self.errorMessage = "Görüntü veya ses bağlantısı kurulamadı: \(error.localizedDescription)"
+          +                if !self.audioCapture.isCapturing {
+          +                    Task { await self.stopLiveVideoMode() }
+          +                }
+          +            }
+          +            self.isCapturingSnapshot = false
+          +            self.snapshotTask = nil
+          +        }
+          +    }
+          +
                /// Stop live video mode
                private func stopLiveVideoMode() async {
           -        guard isLiveVideoMode else {
@@ -962,6 +1581,8 @@ jobs:
           +
           +    /// Called with the handoff guard held, including partial-start failures.
           +    private func finishLiveSession() async {
+          +        let handoff = JarvisAudioHandoff(name: "Jarvis return to listening")
+          +        defer { handoff.end() }
           +        // Clear state and callbacks BEFORE disconnect: the SDK can report its own
           +        // disconnect while we await it. It must not start a second teardown.
           +        isLiveVideoMode = false
@@ -980,6 +1601,12 @@ jobs:
           +        voiceCommandService.stopListening()
           +        voiceCommandService.isBargeInPaused = false
           +
+          +        snapshotTask?.cancel()
+          +        await snapshotTask?.value
+          +        snapshotTask = nil
+          +        isCapturingSnapshot = false
+          +        isContinuousLiveCamera = false
+          +        snapshotRequestedThisTurn = false
           +        let service = activeLiveService
           +        activeLiveService = nil
           +        service?.onDisconnected = nil
@@ -1073,7 +1700,7 @@ jobs:
           +        if service === geminiLive {
           +            geminiLive.onInterrupted = { [weak self] in
           +                self?.audioPlayback.stop()
-          +                self?.liveStopCommand.reset()
+          +                // Do not clear a partially received stop phrase on server interruption.
           +            }
           +            geminiLive.onVideoFrameSent = { [weak self] in self?.lastLiveFrameSentAt = Date() }
           +            geminiLive.onVideoFrameError = { [weak self] in
@@ -1082,7 +1709,7 @@ jobs:
           +        }
                    service.onAudioReceived = { [weak self] data in
           -            self?.audioPlayback.playAudio(data: data)
-          +            guard let self, self.isLiveVideoMode else { return }
+          +            guard let self, self.isLiveVideoMode, !self.isCapturingSnapshot else { return }
           +            self.audioPlayback.playAudio(data: data)
                    }
            
@@ -1109,17 +1736,23 @@ jobs:
           +                if shouldStop {
           +                    self.audioPlayback.stop()
                                await self.stopLiveVideoMode()
+          +                } else if self.liveStopCommand.requestsImage, !self.snapshotRequestedThisTurn {
+          +                    self.requestLiveSnapshot(question: self.userTranscript)
                            }
                        }
-          @@ -1589,6 +1650,7 @@
+                   }
+          @@ -1589,6 +1753,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
-          +                self?.liveStopCommand.reset()
+          +                if self?.isCapturingSnapshot != true {
+          +                    self?.liveStopCommand.reset()
+          +                    self?.snapshotRequestedThisTurn = false
+          +                }
                        }
                    }
            
-          @@ -1969,8 +2031,14 @@
+          @@ -1969,8 +2137,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -1127,6 +1760,7 @@ jobs:
           -            self.geminiVision.sendVideoFrame(image)
           +            // Choose at delivery time: onAppear must not steal an active live stream.
           +            if let service = self.activeLiveService {
+          +                guard self.isContinuousLiveCamera else { return }
           +                if let jpeg = image.jpegData(compressionQuality: 0.6) {
           +                    service.sendVideoFrame(imageData: jpeg)
           +                }
@@ -1136,6 +1770,28 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
+          @@ -2261,3 +2436,21 @@
+                   return result
+               }
+           }
+          +
+          +/// Finite protection for audio ownership changes, not an always-on background workaround.
+          +@MainActor
+          +private final class JarvisAudioHandoff {
+          +    private var identifier = UIBackgroundTaskIdentifier.invalid
+          +
+          +    init(name: String) {
+          +        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+          +            self?.end()
+          +        }
+          +    }
+          +
+          +    func end() {
+          +        guard identifier != .invalid else { return }
+          +        UIApplication.shared.endBackgroundTask(identifier)
+          +        identifier = .invalid
+          +    }
+          +}
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
           @@ -72,6 +72,25 @@
@@ -1164,7 +1820,21 @@ jobs:
                        }
            
                        // Error overlay
-          @@ -217,7 +236,7 @@
+          @@ -123,11 +142,11 @@
+                                           .scaleEffect(1.5)
+                                   )
+           
+          -                    Text("LIVE")
+          +                    Text(glassesManager.isStreaming ? "KAMERA" : "CANLI SES")
+                                   .font(.caption.bold())
+                                   .foregroundColor(.white)
+           
+          -                    Image(systemName: "video.fill")
+          +                    Image(systemName: glassesManager.isStreaming ? "video.fill" : "waveform")
+                                   .font(.caption)
+                                   .foregroundColor(.white)
+                           }
+          @@ -217,13 +236,13 @@
                                    Text(settingsManager.settings.backendDisplayName)
                                        .font(.headline)
                                        .foregroundColor(Theme.heading)
@@ -1173,13 +1843,29 @@ jobs:
                                        .font(.caption)
                                        .foregroundColor(Theme.textSecondary)
                                }
-          @@ -244,8 +263,34 @@
+                           } else if viewModel.agentState == .idle && settingsManager.settings.wakeWordEnabled {
+                               VStack(spacing: 8) {
+          -                        Text("What can I see?")
+          +                        Text("Jarvis hazır")
+                                       .font(.system(size: 30, weight: .bold, design: .rounded))
+                                       .foregroundColor(Theme.heading)
+                                   if viewModel.isVoiceReady {
+          @@ -233,7 +252,7 @@
+                                   } else {
+                                       HStack(spacing: 8) {
+                                           ProgressView().tint(Theme.accent).scaleEffect(0.8)
+          -                                Text("Initializing voice…")
+          +                                Text("Seslenmen bekleniyor…")
+                                               .font(.subheadline)
+                                               .foregroundColor(Theme.textSecondary)
+                                       }
+          @@ -244,8 +263,43 @@
                        .transition(.opacity)
            
                        // The assistant identity: swirling emerald orb (tap to start/stop a session)
           -            SwirlOrb(mode: orbMode, size: 250)
           -                .onTapGesture { viewModel.toggleSession() }
-          +            if viewModel.isLiveVideoMode {
+          +            if viewModel.isLiveVideoMode && glassesManager.isStreaming {
           +                TimelineView(.periodic(from: .now, by: 1)) { context in
           +                    VStack(spacing: 6) {
           +                        if let frame = glassesManager.lastFrame,
@@ -1206,6 +1892,15 @@ jobs:
           +            } else {
           +                SwirlOrb(mode: orbMode, size: 250)
           +                    .onTapGesture { viewModel.toggleSession() }
+          +            }
+          +
+          +            if viewModel.isLiveVideoMode && settingsManager.settings.aiBackend == .geminiLive {
+          +                VStack(spacing: 8) {
+          +                    Text(viewModel.isCapturingSnapshot ? "Görüntü alınıyor…" : "Kamera yalnızca görüntü istediğinde açılır")
+          +                        .font(.caption).foregroundColor(Theme.textSecondary)
+          +                    Button("Ne görüyorsun?") { viewModel.requestLiveSnapshot() }
+          +                        .disabled(viewModel.isCapturingSnapshot)
+          +                }
           +            }
            
                        // Status text
@@ -1239,7 +1934,20 @@ jobs:
                    isModelSpeaking = false
                }
            
-          @@ -247,7 +251,8 @@
+          @@ -208,7 +212,11 @@
+               private func buildSystemPrompt() -> String {
+                   let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
+                   var prompt = """
+          -        You are a helpful AI assistant integrated with smart glasses. You can see what the user sees through their glasses camera.
+          +        You are Jarvis, a helpful voice assistant integrated with smart glasses. Reply in Turkish by default.
+          +        The camera is normally OFF. Never claim to see a current scene without a newly supplied image.
+          +        When the user says "Ne görüyorsun?", "Buna bak" or "Bunu oku", the app will briefly capture
+          +        and send an image with the question. Wait for that image before describing anything.
+          +        Previously supplied images are past snapshots, not a continuing live view.
+           
+                   Keep responses concise and conversational - the user is wearing glasses and expects quick, natural interactions.
+           
+          @@ -247,7 +255,8 @@
            
                /// Send audio data to Gemini
                func sendAudio(data: Data) {
@@ -1249,7 +1957,27 @@ jobs:
            
                    let message: [String: Any] = [
                        "realtimeInput": [
-          @@ -320,8 +325,16 @@
+          @@ -291,6 +300,19 @@
+                   try await sendJSON(message)
+               }
+           
+          +    /// Keep the question and its single fresh image together in one ordered user turn.
+          +    func sendSnapshot(_ jpeg: Data, question: String) async throws {
+          +        guard connectionState.isUsable else { throw AIBackendError.notConnected }
+          +        let parts: [[String: Any]] = [
+          +            ["inlineData": ["mimeType": "image/jpeg", "data": jpeg.base64EncodedString()]],
+          +            ["text": "Bu yeni çekilen görüntüye bakarak Türkçe yanıtla: \(question)"]
+          +        ]
+          +        try await sendJSON(["clientContent": [
+          +            "turns": [["role": "user", "parts": parts]], "turnComplete": true
+          +        ]])
+          +        onVideoFrameSent?()
+          +    }
+          +
+               /// Interrupt the AI (barge-in support)
+               func interrupt() async {
+                   // Send interrupt signal if model is speaking
+          @@ -320,8 +342,16 @@
                        ]
                    ]
            
@@ -1267,7 +1995,7 @@ jobs:
                    }
                }
            
-          @@ -411,23 +424,16 @@
+          @@ -411,23 +441,16 @@
            
                /// Handle server content
                private func handleServerContent(_ content: [String: Any]) {
@@ -1296,7 +2024,7 @@ jobs:
                       let parts = modelTurn["parts"] as? [[String: Any]] {
            
                        for part in parts {
-          @@ -459,6 +465,15 @@
+          @@ -459,6 +482,15 @@
                    if let inputTranscription = content["inputTranscription"] as? [String: Any],
                       let text = inputTranscription["text"] as? String {
                        onInputTranscription?(text)
@@ -1312,9 +2040,256 @@ jobs:
                    }
                }
            
+          --- a/OpenVision/Services/Voice/VoiceCommandService.swift
+          +++ b/OpenVision/Services/Voice/VoiceCommandService.swift
+          @@ -3,6 +3,7 @@
+           
+           import Foundation
+           import Speech
+          +import UIKit
+           import AVFoundation
+           
+           /// Voice command service with wake word detection
+          @@ -99,6 +100,49 @@
+               // MARK: - Audio Engine
+           
+               private var audioEngine: AVAudioEngine?
+          +    private var healthTimer: Timer?
+          +    private var audioObservers: [NSObjectProtocol] = []
+          +    private var audioInterrupted = false
+          +
+          +    /// Only recover an existing listener; never steal the live session's microphone.
+          +    private func checkListenerHealth() {
+          +        guard isListening, !audioInterrupted else { return }
+          +        let needsWake = (state == .idle && isWakeWordEnabled) || state == .conversationMode
+          +        guard needsWake else { return }
+          +        if audioEngine?.isRunning != true || recognitionRequest == nil || recognitionTask == nil {
+          +            try? AVAudioSession.sharedInstance().setActive(true)
+          +            scheduleWakeWordRestart()
+          +        }
+          +    }
+          +
+          +    private func observeAudioLifecycle() {
+          +        let center = NotificationCenter.default
+          +        for name in [AVAudioSession.routeChangeNotification,
+          +                     Notification.Name.AVAudioEngineConfigurationChange,
+          +                     UIApplication.didBecomeActiveNotification] {
+          +            audioObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+          +                Task { @MainActor in self?.checkListenerHealth() }
+          +            })
+          +        }
+          +        audioObservers.append(center.addObserver(forName: AVAudioSession.interruptionNotification,
+          +                                                  object: nil, queue: .main) { [weak self] note in
+          +            let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+          +            let options = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+          +            Task { @MainActor in
+          +                guard let self else { return }
+          +                if type == AVAudioSession.InterruptionType.began.rawValue {
+          +                    self.audioInterrupted = true
+          +                } else if type == AVAudioSession.InterruptionType.ended.rawValue {
+          +                    let mayResume = AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
+          +                    self.audioInterrupted = !mayResume
+          +                    if mayResume, self.isListening {
+          +                        try? AVAudioSession.sharedInstance().setActive(true)
+          +                        self.scheduleWakeWordRestart()
+          +                    }
+          +                }
+          +            }
+          +        })
+          +    }
+           
+               /// Throttle for the wake-word auto-restart. On some audio routes (notably the glasses'
+               /// Bluetooth HFP mic) the recognizer finalizes immediately, and restarting with no delay
+          @@ -137,6 +181,7 @@
+               private init() {
+                   setupActivationSound()
+                   setupSpeechDetector()
+          +        observeAudioLifecycle()
+               }
+           
+               /// Wire VAD events and load the model. The model load is async and may fail (no assets, older
+          @@ -280,6 +325,11 @@
+                   }
+           
+                   isListening = true
+          +        audioInterrupted = false
+          +        healthTimer?.invalidate()
+          +        healthTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+          +            Task { @MainActor in self?.checkListenerHealth() }
+          +        }
+                   state = isWakeWordEnabled ? .idle : .listening
+                   print("[VoiceCommand] Started listening - audio engine running")
+               }
+          @@ -291,7 +341,9 @@
+               private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
+                   request.shouldReportPartialResults = true
+                   request.taskHint = .search
+          -        var phrases = ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
+          +        // Avoid the network recognizer for the wake word when the local English model is available.
+          +        request.requiresOnDeviceRecognition = speechRecognizer?.supportsOnDeviceRecognition == true
+          +        var phrases = ["Jarvis", "Hey Jarvis"]
+                   if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
+                   request.contextualStrings = phrases
+               }
+          @@ -328,7 +380,7 @@
+                       // conversationMode → timeout → idle); both still need a live recognizer.
+                       let stillNeedsRecognizer = (self.state == .idle && self.isWakeWordEnabled)
+                           || self.state == .conversationMode
+          -            guard self.isListening, stillNeedsRecognizer else { return }
+          +            guard self.isListening, stillNeedsRecognizer, !self.audioInterrupted else { return }
+                       self.lastRecognizerRestart = Date()
+                       self.restartRecognition()
+                   }
+          @@ -336,6 +388,8 @@
+           
+               /// Stop listening
+               func stopListening() {
+          +        healthTimer?.invalidate()
+          +        healthTimer = nil
+                   recognitionGeneration += 1   // orphan any in-flight callbacks from the dying task
+                   recognitionTask?.cancel()
+                   recognitionTask = nil
+          @@ -539,7 +593,7 @@
+                   case .listening, .conversationMode:
+                       // Strip wake word from transcription (like xmeta does)
+                       var command = transcription
+          -            for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision"] {
+          +            for ww in [wakeWord.lowercased()] {
+                           if let range = command.lowercased().range(of: ww) {
+                               command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                               break
+          @@ -646,12 +700,7 @@
+               /// word up front rejects those phantoms while still catching a real interrupt.
+               private func wakeWordAtStart(_ text: String) -> Bool {
+                   let lower = text.lowercased()
+          -        let variations = [
+          -            wakeWord.lowercased(),
+          -            "ok vision", "okay vision", "o.k. vision", "o k vision",
+          -            "hey vision", "hi vision",
+          -            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+          -        ]
+          +        let variations = [wakeWord.lowercased()]
+                   for v in variations {
+                       if let r = lower.range(of: v) {
+                           // Characters of speech before the wake word. A little leeway ("uh, ok vision")
+          @@ -670,23 +719,7 @@
+                   let wakeWordLower = wakeWord.lowercased()
+           
+                   // Check for exact match or common variations/misrecognitions
+          -        let variations = [
+          -            wakeWordLower,
+          -            // OK Vision variants (most reliable)
+          -            "ok vision",
+          -            "okay vision",
+          -            "o.k. vision",
+          -            "o k vision",
+          -            // Ok Vision variants
+          -            "hey vision",
+          -            "hi vision",
+          -            // Common misrecognitions
+          -            "a vision",
+          -            "heavy vision",
+          -            "have vision",
+          -            "obey vision",
+          -            "oak vision"
+          -        ]
+          +        let variations = [wakeWordLower]
+           
+                   let detected = variations.contains { lowercased.contains($0) }
+                   if detected {
+          @@ -700,12 +733,7 @@
+                   let lowercased = text.lowercased()
+                   let wakeWordLower = wakeWord.lowercased()
+           
+          -        let variations = [
+          -            wakeWordLower,
+          -            "ok vision", "okay vision", "o.k. vision", "o k vision",
+          -            "hey vision", "hi vision",
+          -            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+          -        ]
+          +        let variations = [wakeWordLower]
+           
+                   for variation in variations {
+                       if let range = lowercased.range(of: variation) {
+          @@ -749,7 +777,7 @@
+                   var command = text
+                   let wakeWordLower = wakeWord.lowercased()
+           
+          -        for prefix in [wakeWordLower, "hey vision", "ok vision", "okay vision"] {
+          +        for prefix in [wakeWordLower] {
+                       if command.lowercased().hasPrefix(prefix) {
+                           command = String(command.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+                           break
+          --- a/OpenVision/Services/Audio/AudioCaptureService.swift
+          +++ b/OpenVision/Services/Audio/AudioCaptureService.swift
+          @@ -61,22 +61,30 @@
+           
+                   // Get native format
+                   let nativeFormat = inputNode.outputFormat(forBus: 0)
+          +        guard nativeFormat.sampleRate > 0, nativeFormat.channelCount > 0 else {
+          +            stopCapture()
+          +            throw AudioCaptureError.inputNodeUnavailable
+          +        }
+                   print("[AudioCapture] Native format: \(nativeFormat)")
+           
+                   // Install tap in native format
+          -        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nativeFormat) { [weak self] buffer, _ in
+          -            self?.processAudioBuffer(buffer, nativeFormat: nativeFormat)
+          -        }
+          -
+          -        try engine.start()
+          +        if OVCatchException({
+          +            inputNode.installTap(onBus: 0, bufferSize: 1024, format: nativeFormat) { [weak self] buffer, _ in
+          +                self?.processAudioBuffer(buffer, nativeFormat: nativeFormat)
+          +            }
+          +        }) != nil {
+          +            stopCapture()
+          +            throw AudioCaptureError.inputNodeUnavailable
+          +        }
+          +
+          +        do { try engine.start() }
+          +        catch { stopCapture(); throw error }
+                   isCapturing = true
+                   print("[AudioCapture] Started capturing")
+               }
+           
+               /// Stop capturing audio
+               func stopCapture() {
+          -        guard isCapturing else { return }
+          -
+                   inputNode?.removeTap(onBus: 0)
+                   audioEngine?.stop()
+                   audioEngine = nil
+          --- a/OpenVision/Managers/SettingsManager.swift
+          +++ b/OpenVision/Managers/SettingsManager.swift
+          @@ -42,6 +42,13 @@
+           
+                   // Load existing settings or create defaults
+                   settings = Self.loadSettings(from: settingsURL)
+          +
+          +        // Apply the requested rename once, including installations with saved preferences.
+          +        if !UserDefaults.standard.bool(forKey: "jarvisWakeMigrationV4") {
+          +            settings.wakeWord = "Jarvis"
+          +            performSave()
+          +            UserDefaults.standard.set(true, forKey: "jarvisWakeMigrationV4")
+          +        }
+           
+                   print("[SettingsManager] Initialized with settings from: \(settingsURL.path)")
+               }
+          --- a/OpenVision/Models/AppSettings.swift
+          +++ b/OpenVision/Models/AppSettings.swift
+          @@ -117,7 +117,7 @@
+               // MARK: - Voice Settings
+           
+               /// Wake word phrase (default: "Ok Vision")
+          -    var wakeWord: String = "Ok Vision"
+          +    var wakeWord: String = "Jarvis"
+           
+               /// Whether wake word detection is enabled (OpenClaw mode only)
+               var wakeWordEnabled: Bool = true
           --- /dev/null
           +++ b/OpenVision/Services/Voice/LiveStopCommand.swift
-          @@ -0,0 +1,38 @@
+          @@ -0,0 +1,55 @@
           +import Foundation
           +
           +/// Live transcripts may arrive as word fragments or as a cumulative utterance.
@@ -1344,12 +2319,29 @@ jobs:
           +            .filter { !$0.isEmpty }.joined(separator: " ")
           +        let exact = ["dur", "dur dur", "lutfen dur", "dur lutfen", "sus", "yeter",
           +                     "stop", "stop please", "please stop"]
+          +        // Background speech can precede/follow the command. Match a whole word,
+          +        // never the beginnings of "durum", "durak" or "durdurma".
+          +        let chunkWords = text.lowercased(with: Locale(identifier: "tr_TR"))
+          +            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+          +        if normalized.split(separator: " ").contains("dur") || chunkWords.contains("dur") { return true }
           +        if exact.contains(normalized) { return true }
           +        let phrases = ["konusmayi durdur", "konusmayi bitir", "sohbeti bitir",
           +                       "videoyu durdur", "kamerayi kapat", "dinlemeyi durdur",
           +                       "stop video", "stop streaming", "stop live", "end video",
           +                       "exit video", "disable video", "stop the video", "end live",
           +                       "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
+          +        return phrases.contains { (" " + normalized + " ").contains(" " + $0 + " ") }
+          +    }
+          +
+          +    var requestsImage: Bool {
+          +        let normalized = transcript.lowercased(with: Locale(identifier: "tr_TR"))
+          +            .folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US"))
+          +            .replacingOccurrences(of: "ı", with: "i")
+          +            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+          +            .filter { !$0.isEmpty }.joined(separator: " ")
+          +        let phrases = ["ne goruyorsun", "ne gordugunu soyle", "buna bak", "suna bak",
+          +                       "onumde ne var", "bunu oku", "su yaziyi oku", "kameradan bak",
+          +                       "what do you see", "what can you see", "look at this", "read this"]
           +        return phrases.contains { (" " + normalized + " ").contains(" " + $0 + " ") }
           +    }
           +}
@@ -1358,6 +2350,10 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentView.swift
           xcrun swiftc -frontend -parse OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/Voice/VoiceCommandService.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/Audio/AudioCaptureService.swift
+          xcrun swiftc -frontend -parse OpenVision/Managers/SettingsManager.swift
+          xcrun swiftc -frontend -parse OpenVision/Models/AppSettings.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Voice/LiveStopCommand.swift
           cat > build/live-control-tests.swift <<'LIVE_TESTS'
           import Foundation
@@ -1366,12 +2362,13 @@ jobs:
           struct LiveControlTests {
               static func main() {
                   for phrase in ["dur", "DUR!", "Lütfen dur.", "Konuşmayı bitir", "konuşmayı durdur",
-                                 "kamerayı kapat", "Stop video", "please stop streaming"] {
+                                 "kamerayı kapat", "Stop video", "please stop streaming",
+                                 "arkadaki sesler dur yeter artık", "Bir dur bakalım ne olmuş"] {
                       var matcher = LiveStopCommand()
                       precondition(matcher.consume(phrase), "Missed control: \(phrase)")
                   }
                   for phrase in ["durum nasıl", "durdurma", "stopwatch",
-                                 "Durak nerede?", "Bir dur bakalım ne olmuş", "konuşmayı bitirme"] {
+                                 "Durak nerede?", "konuşmayı bitirme"] {
                       var matcher = LiveStopCommand()
                       precondition(!matcher.consume(phrase), "False stop: \(phrase)")
                   }
@@ -1388,7 +2385,25 @@ jobs:
                   let now = Date()
                   precondition(!matcher.consume("konuşmayı ", at: now))
                   precondition(!matcher.consume("bitir", at: now.addingTimeInterval(5)))
+                  matcher.reset()
+                  precondition(!matcher.consume("televizyonda konuşuyorlar"))
+                  precondition(matcher.consume("dur"))
+                  for phrase in ["Ne görüyorsun?", "Jarvis buna bak", "şu yazıyı oku", "what do you see"] {
+                      matcher.reset()
+                      _ = matcher.consume(phrase)
+                      precondition(matcher.requestsImage, "Missed camera request: \(phrase)")
+                  }
+                  for phrase in ["Merhaba", "görüşürüz", "kamera kapalı mı", "havanın durumu nasıl"] {
+                      matcher.reset()
+                      _ = matcher.consume(phrase)
+                      precondition(!matcher.requestsImage, "Unrequested camera: \(phrase)")
+                  }
+                  matcher.reset()
+                  _ = matcher.consume("ne görü")
+                  _ = matcher.consume("yorsun")
+                  precondition(matcher.requestsImage)
                   print("PASS: Turkish / English commands, fragments, cumulative text, false matches, and expiry")
+                  print("PASS: explicit image requests, fragmented image requests, and camera-off ordinary speech")
               }
           }
           LIVE_TESTS
@@ -1413,7 +2428,7 @@ jobs:
             CODE_SIGN_IDENTITY= \
             CODE_SIGN_ENTITLEMENTS= \
             DEVELOPMENT_TEAM= \
-            CURRENT_PROJECT_VERSION=3 \
+            CURRENT_PROJECT_VERSION=4 \
             build 2>&1 | tee build/xcodebuild.log
 
       - name: Windows icin IPA dosyasini paketle
