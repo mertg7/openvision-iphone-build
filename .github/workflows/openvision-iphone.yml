@@ -8,7 +8,7 @@ permissions:
 
 concurrency:
   group: openvision-personal-build
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -360,7 +360,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1550,189 @@
+          @@ -1486,89 +1550,191 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -378,6 +378,8 @@ jobs:
           +            errorMessage = "Tek görüntü almak için önce video kaydını durdur."
           +            return
           +        }
+          +        // A button request must not reuse the previous conversation's transcript.
+          +        userTranscript = question
           +        snapshotRequestedThisTurn = true
           +        isCapturingSnapshot = true
           +        errorMessage = nil
@@ -613,7 +615,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1753,10 @@
+          @@ -1589,6 +1755,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -624,7 +626,7 @@ jobs:
                        }
                    }
            
-          @@ -1969,8 +2137,15 @@
+          @@ -1969,8 +2139,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -642,7 +644,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2436,21 @@
+          @@ -2261,3 +2438,21 @@
                    return result
                }
            }
@@ -1488,7 +1490,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1550,189 @@
+          @@ -1486,89 +1550,191 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -1506,6 +1508,8 @@ jobs:
           +            errorMessage = "Tek görüntü almak için önce video kaydını durdur."
           +            return
           +        }
+          +        // A button request must not reuse the previous conversation's transcript.
+          +        userTranscript = question
           +        snapshotRequestedThisTurn = true
           +        isCapturingSnapshot = true
           +        errorMessage = nil
@@ -1741,7 +1745,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1753,10 @@
+          @@ -1589,6 +1755,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -1752,7 +1756,7 @@ jobs:
                        }
                    }
            
-          @@ -1969,8 +2137,15 @@
+          @@ -1969,8 +2139,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -1770,7 +1774,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2436,21 @@
+          @@ -2261,3 +2438,21 @@
                    return result
                }
            }
