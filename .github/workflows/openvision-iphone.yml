@@ -93,16 +93,18 @@ jobs:
           git apply --check <<'WAKE_PATCH'
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
-          @@ -50,6 +50,8 @@
+          @@ -50,6 +50,10 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
           +    // Serialize microphone handoffs. Engine/SDK callbacks can arrive during teardown.
           +    private var isChangingLiveMode = false
+          +    private var liveStopCommand = LiveStopCommand()
+          +    @Published var lastLiveFrameSentAt: Date = .distantPast
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -126,6 +128,11 @@
+          @@ -126,6 +130,11 @@
                // MARK: - Observed state changes (forwarded from the view's onChange hooks)
            
                func ttsSpeakingChanged(_ isSpeaking: Bool) {
@@ -114,7 +116,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +190,11 @@
+          @@ -183,6 +192,11 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -126,7 +128,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +266,7 @@
+          @@ -254,6 +268,7 @@
                }
            
                func startSession() {
@@ -134,7 +136,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +275,13 @@
+          @@ -262,6 +277,13 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -148,7 +150,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -382,11 +402,13 @@
+          @@ -382,11 +404,13 @@
                }
            
                func stopSession() {
@@ -162,7 +164,7 @@ jobs:
                    }
            
                    Task {
-          @@ -533,6 +555,7 @@
+          @@ -533,6 +557,7 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -170,7 +172,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -795,6 +818,7 @@
+          @@ -795,6 +820,7 @@
            
                /// Start listening for wake word
                private func startWakeWordListening() {
@@ -178,7 +180,7 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -971,12 +995,15 @@
+          @@ -971,12 +997,15 @@
            
                /// Start live video mode - Gemini handles both audio and video
                private func startLiveVideoMode() async {
@@ -194,7 +196,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,9 +1019,14 @@
+          @@ -992,9 +1021,14 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -209,7 +211,37 @@ jobs:
                    activeLiveService = service
            
                    print("[VoiceAgent] Starting live video mode via \(label)...")
-          @@ -1021,17 +1053,7 @@
+          @@ -1011,9 +1045,28 @@
+                   audioCapture.targetSampleRate = Double(service.inputSampleRate)
+                   audioPlayback.inputSampleRate = Double(service.outputSampleRate)
+           
+          -        // Start glasses streaming
+          +        // Registration alone does not mean the camera is delivering frames.
+          +        errorMessage = nil
+          +        glassesManager.errorMessage = nil
+          +        lastLiveFrameSentAt = .distantPast
+          +        liveStopCommand.reset()
+          +        let cameraStart = Date()
+                   if !glassesManager.isStreaming {
+                       await glassesManager.startStreaming()
+          +        }
+          +        let frameDeadline = Date().addingTimeInterval(6)
+          +        while glassesManager.isStreaming && Date() < frameDeadline {
+          +            if glassesManager.lastFrame != nil, glassesManager.lastFrameTime >= cameraStart {
+          +                break
+          +            }
+          +            try? await Task.sleep(nanoseconds: 100_000_000)
+          +        }
+          +        guard glassesManager.isStreaming, glassesManager.lastFrame != nil,
+          +              glassesManager.lastFrameTime >= cameraStart else {
+          +            let reason = glassesManager.errorMessage ?? "Gözlükten yeni görüntü gelmedi."
+          +            await finishLiveSession()
+          +            errorMessage = "Kamera açılamadı: \(reason) Gözlüğün bağlı ve takılı olduğunu kontrol et."
+          +            return
+                   }
+           
+                   // Connect to the live backend
+          @@ -1021,17 +1074,7 @@
                        try await service.connect()
                    } catch {
                        errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
@@ -228,7 +260,7 @@ jobs:
                        return
                    }
            
-          @@ -1045,9 +1067,14 @@
+          @@ -1045,9 +1088,14 @@
            
                    // Setup audio playback
                    do {
@@ -244,18 +276,30 @@ jobs:
                    }
            
                    // Start audio capture
-          @@ -1055,9 +1082,7 @@
+          @@ -1055,26 +1103,24 @@
                        try audioCapture.startCapture()
                    } catch {
                        errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
           -            await service.disconnect()
           -            activeLiveService = nil
           -            voiceCommandService.enterConversationMode()
+          -            return
+          -        }
+          -
+          -        // Setup video frame routing to the live backend
+          -        glassesManager.onVideoFrame = { [weak service] image in
+          -            if let jpegData = image.jpegData(compressionQuality: 0.6) {
+          -                service?.sendVideoFrame(imageData: jpegData)
+          -            }
           +            await finishLiveSession()
-                       return
-                   }
-           
-          @@ -1069,6 +1094,7 @@
+          +            return
+          +        }
+          +
+          +        // This routing also survives onAppear (returning from Settings / camera permission).
+          +        setupGlassesCallbacks()
+          +        if let frame = glassesManager.lastFrame,
+          +           let jpeg = frame.jpegData(compressionQuality: 0.6) {
+          +            service.sendVideoFrame(imageData: jpeg)
                    }
            
                    isLiveVideoMode = true
@@ -263,7 +307,14 @@ jobs:
                    agentState = .liveVideo
            
                    print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
-          @@ -1488,60 +1514,69 @@
+           
+          -        // Announce to user
+          -        ttsService.speak("Live video mode active")
+          +        // Do not play a spoken announcement into the newly opened live microphone.
+               }
+           
+               /// Resolve which live-video backend to use, or nil if none is configured.
+          @@ -1488,86 +1534,101 @@
            
                /// Stop live video mode
                private func stopLiveVideoMode() async {
@@ -304,6 +355,11 @@ jobs:
           +        service?.onInputTranscription = nil
           +        service?.onOutputTranscription = nil
           +        service?.onTurnComplete = nil
+          +        geminiLive.onInterrupted = nil
+          +        geminiLive.onVideoFrameSent = nil
+          +        geminiLive.onVideoFrameError = nil
+          +        liveStopCommand.reset()
+          +        lastLiveFrameSentAt = .distantPast
           +        audioCapture.onAudioCaptured = nil
                    audioCapture.stopCapture()
           -        audioCapture.onAudioCaptured = nil
@@ -322,9 +378,9 @@ jobs:
                    }
           -
           -        // Restore video frame callback to Gemini Vision
-                   glassesManager.onVideoFrame = { [weak self] image in
-                       self?.geminiVision.sendVideoFrame(image)
-                   }
+          -        glassesManager.onVideoFrame = { [weak self] image in
+          -            self?.geminiVision.sendVideoFrame(image)
+          -        }
           -
           -        isLiveVideoMode = false
           -        agentState = isSessionActive ? .listening : .idle
@@ -351,6 +407,7 @@ jobs:
           -
           -        print("[VoiceAgent] Live video mode stopped")
           -        ttsService.speak("Live video mode ended")
+          +        setupGlassesCallbacks()
           +        userTranscript = ""
           +        aiTranscript = ""
           +        currentToolName = nil
@@ -378,20 +435,308 @@ jobs:
                }
            
                /// Setup live backend callbacks for audio/transcription (Gemini Live or OpenAI Realtime)
+               private func setupLiveVideoCallbacks(_ service: any LiveVideoService) {
+          -        // Audio from the model → playback
+          +        // An interruption discards already buffered speech immediately.
+          +        if service === geminiLive {
+          +            geminiLive.onInterrupted = { [weak self] in
+          +                self?.audioPlayback.stop()
+          +                self?.liveStopCommand.reset()
+          +            }
+          +            geminiLive.onVideoFrameSent = { [weak self] in self?.lastLiveFrameSentAt = Date() }
+          +            geminiLive.onVideoFrameError = { [weak self] in
+          +                self?.errorMessage = "Kamera görüntüsü Gemini'ye gönderilemedi. Bağlantıyı kontrol et."
+          +            }
+          +        }
+                   service.onAudioReceived = { [weak self] data in
+          -            self?.audioPlayback.playAudio(data: data)
+          +            guard let self, self.isLiveVideoMode else { return }
+          +            self.audioPlayback.playAudio(data: data)
+                   }
+           
+                   // Transcription updates - also check for stop commands
+                   service.onInputTranscription = { [weak self] text in
+                       Task { @MainActor in
+                           guard let self else { return }
+          -                self.userTranscript = text
+          -
+          -                // Check for stop video commands in what the user said
+          -                let lowerText = text.lowercased()
+          -                let stopKeywords = ["stop video", "stop streaming", "stop live", "end video",
+          -                                   "exit video", "disable video", "stop the video", "end live",
+          -                                   // Hindi fallbacks (models sometimes transcribe English as Hindi)
+          -                                   "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
+          -
+          -                let isStopCommand = stopKeywords.contains { lowerText.contains($0) }
+          -
+          -                if isStopCommand && self.isLiveVideoMode {
+          -                    print("[VoiceAgent] Stop command detected in transcription: \(text)")
+          +                guard self.isLiveVideoMode else { return }
+          +                let shouldStop = self.liveStopCommand.consume(text)
+          +                self.userTranscript = self.liveStopCommand.transcript
+          +                if shouldStop {
+          +                    self.audioPlayback.stop()
+                               await self.stopLiveVideoMode()
+                           }
+                       }
+          @@ -1589,6 +1650,7 @@
+                           MetricsCollector.shared.count(liveTurnEvent)
+                           // History: persist this live-video exchange (transcript only, no frames).
+                           self?.recordLiveTurn()
+          +                self?.liveStopCommand.reset()
+                       }
+                   }
+           
+          @@ -1969,8 +2031,14 @@
+                   // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
+                   glassesManager.onVideoFrame = { [weak self] image in
+                       guard let self else { return }
+          -            // Send frame to Gemini Vision for live analysis
+          -            self.geminiVision.sendVideoFrame(image)
+          +            // Choose at delivery time: onAppear must not steal an active live stream.
+          +            if let service = self.activeLiveService {
+          +                if let jpeg = image.jpegData(compressionQuality: 0.6) {
+          +                    service.sendVideoFrame(imageData: jpeg)
+          +                }
+          +            } else {
+          +                self.geminiVision.sendVideoFrame(image)
+          +            }
+           
+                       // Log periodically (every 30 frames = ~1 second at 30fps)
+                       Task { @MainActor in
+          --- a/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
+          +++ b/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
+          @@ -72,6 +72,25 @@
+                                   .padding(.bottom, 28)
+                           }
+                           .transition(.move(edge: .bottom).combined(with: .opacity))
+          +            }
+          +
+          +            if viewModel.isLiveVideoMode {
+          +                VStack {
+          +                    HStack {
+          +                        Spacer()
+          +                        Button { viewModel.stopSession() } label: {
+          +                            Label("Durdur", systemImage: "stop.circle.fill")
+          +                                .font(.headline)
+          +                                .padding(12)
+          +                                .background(Capsule().fill(Color.red))
+          +                                .foregroundColor(.white)
+          +                        }
+          +                        .accessibilityLabel("Konuşmayı ve kamerayı durdur")
+          +                    }
+          +                    .padding(.horizontal)
+          +                    .padding(.top, 64)
+          +                    Spacer()
+          +                }
+                       }
+           
+                       // Error overlay
+          @@ -217,7 +236,7 @@
+                                   Text(settingsManager.settings.backendDisplayName)
+                                       .font(.headline)
+                                       .foregroundColor(Theme.heading)
+          -                        Text("Say \"stop video\" to exit")
+          +                        Text("Bitirmek için \"Dur\" de veya Durdur’a dokun")
+                                       .font(.caption)
+                                       .foregroundColor(Theme.textSecondary)
+                               }
+          @@ -244,8 +263,34 @@
+                       .transition(.opacity)
+           
+                       // The assistant identity: swirling emerald orb (tap to start/stop a session)
+          -            SwirlOrb(mode: orbMode, size: 250)
+          -                .onTapGesture { viewModel.toggleSession() }
+          +            if viewModel.isLiveVideoMode {
+          +                TimelineView(.periodic(from: .now, by: 1)) { context in
+          +                    VStack(spacing: 6) {
+          +                        if let frame = glassesManager.lastFrame,
+          +                           context.date.timeIntervalSince(glassesManager.lastFrameTime) < 3 {
+          +                            Image(uiImage: frame)
+          +                                .resizable()
+          +                                .scaledToFit()
+          +                                .frame(maxWidth: 220, maxHeight: 145)
+          +                                .clipShape(RoundedRectangle(cornerRadius: 14))
+          +                            Text("Gözlüğün görüntüsü")
+          +                                .font(.caption).foregroundColor(Theme.textSecondary)
+          +                        } else {
+          +                            Label("Gözlükten görüntü gelmiyor", systemImage: "video.slash")
+          +                                .font(.caption).foregroundColor(.orange)
+          +                        }
+          +                        if settingsManager.settings.aiBackend == .geminiLive {
+          +                            Text(context.date.timeIntervalSince(viewModel.lastLiveFrameSentAt) < 3
+          +                                 ? "Görüntü Gemini'ye gönderiliyor"
+          +                                 : "Gemini'ye görüntü gönderimi bekleniyor")
+          +                                .font(.caption2).foregroundColor(Theme.textSecondary)
+          +                        }
+          +                    }
+          +                }
+          +            } else {
+          +                SwirlOrb(mode: orbMode, size: 250)
+          +                    .onTapGesture { viewModel.toggleSession() }
+          +            }
+           
+                       // Status text
+                       Text(viewModel.agentState.displayText)
+          --- a/OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          +++ b/OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          @@ -40,6 +40,9 @@
+               var onOutputTranscription: ((String) -> Void)?
+               var onConnectionStateChanged: ((AIConnectionState) -> Void)?
+               var onDisconnected: (() -> Void)?
+          +    var onInterrupted: (() -> Void)?
+          +    var onVideoFrameSent: (() -> Void)?
+          +    var onVideoFrameError: (() -> Void)?
+           
+               // MARK: - WebSocket
+           
+          @@ -52,7 +55,7 @@
+           
+               private var lastFrameTime: Date = .distantPast
+               private var frameInterval: TimeInterval {
+          -        1.0 / Double(videoFPS)
+          +        1.0  // Gemini Live accepts at most one video frame per second.
+               }
+           
+               // MARK: - Latency Tracking
+          @@ -163,6 +166,7 @@
+                   urlSession = nil
+           
+                   isSetupComplete = false
+          +        lastFrameTime = .distantPast
+                   isModelSpeaking = false
+               }
+           
+          @@ -247,7 +251,8 @@
+           
+               /// Send audio data to Gemini
+               func sendAudio(data: Data) {
+          -        guard connectionState.isUsable, !isModelSpeaking else { return }
+          +        // Keep sending while the model speaks, so VAD can hear "dur" / interruptions.
+          +        guard connectionState.isUsable else { return }
+           
+                   let message: [String: Any] = [
+                       "realtimeInput": [
+          @@ -320,8 +325,16 @@
+                       ]
+                   ]
+           
+          +        let sessionSocket = webSocket
+                   Task {
+          -            try? await sendJSON(message)
+          +            do {
+          +                try await sendJSON(message)
+          +                guard webSocket === sessionSocket, connectionState.isUsable else { return }
+          +                onVideoFrameSent?()
+          +            } catch {
+          +                guard webSocket === sessionSocket, connectionState.isUsable else { return }
+          +                onVideoFrameError?()
+          +            }
+                   }
+               }
+           
+          @@ -411,23 +424,16 @@
+           
+               /// Handle server content
+               private func handleServerContent(_ content: [String: Any]) {
+          -        // Check if turn complete
+          -        if content["turnComplete"] as? Bool == true {
+          +        // Flags can share a message with transcription; never discard that text.
+          +        let interrupted = content["interrupted"] as? Bool == true
+          +        if interrupted {
+                       isModelSpeaking = false
+                       isProcessing = false
+          -            onTurnComplete?()
+          -            return
+          -        }
+          -
+          -        // Check if interrupted
+          -        if content["interrupted"] as? Bool == true {
+          -            isModelSpeaking = false
+          -            isProcessing = false
+          -            return
+          +            onInterrupted?()
+                   }
+           
+                   // Model turn
+          -        if let modelTurn = content["modelTurn"] as? [String: Any],
+          +        if !interrupted, let modelTurn = content["modelTurn"] as? [String: Any],
+                      let parts = modelTurn["parts"] as? [[String: Any]] {
+           
+                       for part in parts {
+          @@ -459,6 +465,15 @@
+                   if let inputTranscription = content["inputTranscription"] as? [String: Any],
+                      let text = inputTranscription["text"] as? String {
+                       onInputTranscription?(text)
+          +        }
+          +        if let output = content["outputTranscription"] as? [String: Any],
+          +           let text = output["text"] as? String {
+          +            onOutputTranscription?(text)
+          +        }
+          +        if content["turnComplete"] as? Bool == true {
+          +            isModelSpeaking = false
+          +            isProcessing = false
+          +            onTurnComplete?()
+                   }
+               }
+           
+          --- /dev/null
+          +++ b/OpenVision/Services/Voice/LiveStopCommand.swift
+          @@ -0,0 +1,38 @@
+          +import Foundation
+          +
+          +/// Live transcripts may arrive as word fragments or as a cumulative utterance.
+          +/// Only explicit control phrases stop the session, not substrings ("durum", "stopwatch").
+          +struct LiveStopCommand {
+          +    private(set) var transcript = ""
+          +    private var lastUpdate = Date.distantPast
+          +
+          +    mutating func reset() {
+          +        transcript = ""
+          +        lastUpdate = .distantPast
+          +    }
+          +
+          +    mutating func consume(_ text: String, at now: Date = Date()) -> Bool {
+          +        if now.timeIntervalSince(lastUpdate) > 4 { transcript = "" }
+          +        lastUpdate = now
+          +        if transcript.isEmpty || text.hasPrefix(transcript) {
+          +            transcript = text
+          +        } else {
+          +            transcript += text
+          +        }
+          +        transcript = String(transcript.suffix(500))
+          +        let normalized = transcript.lowercased(with: Locale(identifier: "tr_TR"))
+          +            .folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US"))
+          +            .replacingOccurrences(of: "ı", with: "i")
+          +            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+          +            .filter { !$0.isEmpty }.joined(separator: " ")
+          +        let exact = ["dur", "dur dur", "lutfen dur", "dur lutfen", "sus", "yeter",
+          +                     "stop", "stop please", "please stop"]
+          +        if exact.contains(normalized) { return true }
+          +        let phrases = ["konusmayi durdur", "konusmayi bitir", "sohbeti bitir",
+          +                       "videoyu durdur", "kamerayi kapat", "dinlemeyi durdur",
+          +                       "stop video", "stop streaming", "stop live", "end video",
+          +                       "exit video", "disable video", "stop the video", "end live",
+          +                       "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
+          +        return phrases.contains { (" " + normalized + " ").contains(" " + $0 + " ") }
+          +    }
+          +}
           WAKE_PATCH
           git apply <<'WAKE_PATCH'
           --- a/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           +++ b/OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
-          @@ -50,6 +50,8 @@
+          @@ -50,6 +50,10 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
           +    // Serialize microphone handoffs. Engine/SDK callbacks can arrive during teardown.
           +    private var isChangingLiveMode = false
+          +    private var liveStopCommand = LiveStopCommand()
+          +    @Published var lastLiveFrameSentAt: Date = .distantPast
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -126,6 +128,11 @@
+          @@ -126,6 +130,11 @@
                // MARK: - Observed state changes (forwarded from the view's onChange hooks)
            
                func ttsSpeakingChanged(_ isSpeaking: Bool) {
@@ -403,7 +748,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +190,11 @@
+          @@ -183,6 +192,11 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -415,7 +760,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +266,7 @@
+          @@ -254,6 +268,7 @@
                }
            
                func startSession() {
@@ -423,7 +768,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +275,13 @@
+          @@ -262,6 +277,13 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -437,7 +782,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -382,11 +402,13 @@
+          @@ -382,11 +404,13 @@
                }
            
                func stopSession() {
@@ -451,7 +796,7 @@ jobs:
                    }
            
                    Task {
-          @@ -533,6 +555,7 @@
+          @@ -533,6 +557,7 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -459,7 +804,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -795,6 +818,7 @@
+          @@ -795,6 +820,7 @@
            
                /// Start listening for wake word
                private func startWakeWordListening() {
@@ -467,7 +812,7 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -971,12 +995,15 @@
+          @@ -971,12 +997,15 @@
            
                /// Start live video mode - Gemini handles both audio and video
                private func startLiveVideoMode() async {
@@ -483,7 +828,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,9 +1019,14 @@
+          @@ -992,9 +1021,14 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -498,7 +843,37 @@ jobs:
                    activeLiveService = service
            
                    print("[VoiceAgent] Starting live video mode via \(label)...")
-          @@ -1021,17 +1053,7 @@
+          @@ -1011,9 +1045,28 @@
+                   audioCapture.targetSampleRate = Double(service.inputSampleRate)
+                   audioPlayback.inputSampleRate = Double(service.outputSampleRate)
+           
+          -        // Start glasses streaming
+          +        // Registration alone does not mean the camera is delivering frames.
+          +        errorMessage = nil
+          +        glassesManager.errorMessage = nil
+          +        lastLiveFrameSentAt = .distantPast
+          +        liveStopCommand.reset()
+          +        let cameraStart = Date()
+                   if !glassesManager.isStreaming {
+                       await glassesManager.startStreaming()
+          +        }
+          +        let frameDeadline = Date().addingTimeInterval(6)
+          +        while glassesManager.isStreaming && Date() < frameDeadline {
+          +            if glassesManager.lastFrame != nil, glassesManager.lastFrameTime >= cameraStart {
+          +                break
+          +            }
+          +            try? await Task.sleep(nanoseconds: 100_000_000)
+          +        }
+          +        guard glassesManager.isStreaming, glassesManager.lastFrame != nil,
+          +              glassesManager.lastFrameTime >= cameraStart else {
+          +            let reason = glassesManager.errorMessage ?? "Gözlükten yeni görüntü gelmedi."
+          +            await finishLiveSession()
+          +            errorMessage = "Kamera açılamadı: \(reason) Gözlüğün bağlı ve takılı olduğunu kontrol et."
+          +            return
+                   }
+           
+                   // Connect to the live backend
+          @@ -1021,17 +1074,7 @@
                        try await service.connect()
                    } catch {
                        errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
@@ -517,7 +892,7 @@ jobs:
                        return
                    }
            
-          @@ -1045,9 +1067,14 @@
+          @@ -1045,9 +1088,14 @@
            
                    // Setup audio playback
                    do {
@@ -533,18 +908,30 @@ jobs:
                    }
            
                    // Start audio capture
-          @@ -1055,9 +1082,7 @@
+          @@ -1055,26 +1103,24 @@
                        try audioCapture.startCapture()
                    } catch {
                        errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
           -            await service.disconnect()
           -            activeLiveService = nil
           -            voiceCommandService.enterConversationMode()
+          -            return
+          -        }
+          -
+          -        // Setup video frame routing to the live backend
+          -        glassesManager.onVideoFrame = { [weak service] image in
+          -            if let jpegData = image.jpegData(compressionQuality: 0.6) {
+          -                service?.sendVideoFrame(imageData: jpegData)
+          -            }
           +            await finishLiveSession()
-                       return
-                   }
-           
-          @@ -1069,6 +1094,7 @@
+          +            return
+          +        }
+          +
+          +        // This routing also survives onAppear (returning from Settings / camera permission).
+          +        setupGlassesCallbacks()
+          +        if let frame = glassesManager.lastFrame,
+          +           let jpeg = frame.jpegData(compressionQuality: 0.6) {
+          +            service.sendVideoFrame(imageData: jpeg)
                    }
            
                    isLiveVideoMode = true
@@ -552,7 +939,14 @@ jobs:
                    agentState = .liveVideo
            
                    print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
-          @@ -1488,60 +1514,69 @@
+           
+          -        // Announce to user
+          -        ttsService.speak("Live video mode active")
+          +        // Do not play a spoken announcement into the newly opened live microphone.
+               }
+           
+               /// Resolve which live-video backend to use, or nil if none is configured.
+          @@ -1488,86 +1534,101 @@
            
                /// Stop live video mode
                private func stopLiveVideoMode() async {
@@ -593,6 +987,11 @@ jobs:
           +        service?.onInputTranscription = nil
           +        service?.onOutputTranscription = nil
           +        service?.onTurnComplete = nil
+          +        geminiLive.onInterrupted = nil
+          +        geminiLive.onVideoFrameSent = nil
+          +        geminiLive.onVideoFrameError = nil
+          +        liveStopCommand.reset()
+          +        lastLiveFrameSentAt = .distantPast
           +        audioCapture.onAudioCaptured = nil
                    audioCapture.stopCapture()
           -        audioCapture.onAudioCaptured = nil
@@ -611,9 +1010,9 @@ jobs:
                    }
           -
           -        // Restore video frame callback to Gemini Vision
-                   glassesManager.onVideoFrame = { [weak self] image in
-                       self?.geminiVision.sendVideoFrame(image)
-                   }
+          -        glassesManager.onVideoFrame = { [weak self] image in
+          -            self?.geminiVision.sendVideoFrame(image)
+          -        }
           -
           -        isLiveVideoMode = false
           -        agentState = isSessionActive ? .listening : .idle
@@ -640,6 +1039,7 @@ jobs:
           -
           -        print("[VoiceAgent] Live video mode stopped")
           -        ttsService.speak("Live video mode ended")
+          +        setupGlassesCallbacks()
           +        userTranscript = ""
           +        aiTranscript = ""
           +        currentToolName = nil
@@ -667,8 +1067,333 @@ jobs:
                }
            
                /// Setup live backend callbacks for audio/transcription (Gemini Live or OpenAI Realtime)
+               private func setupLiveVideoCallbacks(_ service: any LiveVideoService) {
+          -        // Audio from the model → playback
+          +        // An interruption discards already buffered speech immediately.
+          +        if service === geminiLive {
+          +            geminiLive.onInterrupted = { [weak self] in
+          +                self?.audioPlayback.stop()
+          +                self?.liveStopCommand.reset()
+          +            }
+          +            geminiLive.onVideoFrameSent = { [weak self] in self?.lastLiveFrameSentAt = Date() }
+          +            geminiLive.onVideoFrameError = { [weak self] in
+          +                self?.errorMessage = "Kamera görüntüsü Gemini'ye gönderilemedi. Bağlantıyı kontrol et."
+          +            }
+          +        }
+                   service.onAudioReceived = { [weak self] data in
+          -            self?.audioPlayback.playAudio(data: data)
+          +            guard let self, self.isLiveVideoMode else { return }
+          +            self.audioPlayback.playAudio(data: data)
+                   }
+           
+                   // Transcription updates - also check for stop commands
+                   service.onInputTranscription = { [weak self] text in
+                       Task { @MainActor in
+                           guard let self else { return }
+          -                self.userTranscript = text
+          -
+          -                // Check for stop video commands in what the user said
+          -                let lowerText = text.lowercased()
+          -                let stopKeywords = ["stop video", "stop streaming", "stop live", "end video",
+          -                                   "exit video", "disable video", "stop the video", "end live",
+          -                                   // Hindi fallbacks (models sometimes transcribe English as Hindi)
+          -                                   "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
+          -
+          -                let isStopCommand = stopKeywords.contains { lowerText.contains($0) }
+          -
+          -                if isStopCommand && self.isLiveVideoMode {
+          -                    print("[VoiceAgent] Stop command detected in transcription: \(text)")
+          +                guard self.isLiveVideoMode else { return }
+          +                let shouldStop = self.liveStopCommand.consume(text)
+          +                self.userTranscript = self.liveStopCommand.transcript
+          +                if shouldStop {
+          +                    self.audioPlayback.stop()
+                               await self.stopLiveVideoMode()
+                           }
+                       }
+          @@ -1589,6 +1650,7 @@
+                           MetricsCollector.shared.count(liveTurnEvent)
+                           // History: persist this live-video exchange (transcript only, no frames).
+                           self?.recordLiveTurn()
+          +                self?.liveStopCommand.reset()
+                       }
+                   }
+           
+          @@ -1969,8 +2031,14 @@
+                   // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
+                   glassesManager.onVideoFrame = { [weak self] image in
+                       guard let self else { return }
+          -            // Send frame to Gemini Vision for live analysis
+          -            self.geminiVision.sendVideoFrame(image)
+          +            // Choose at delivery time: onAppear must not steal an active live stream.
+          +            if let service = self.activeLiveService {
+          +                if let jpeg = image.jpegData(compressionQuality: 0.6) {
+          +                    service.sendVideoFrame(imageData: jpeg)
+          +                }
+          +            } else {
+          +                self.geminiVision.sendVideoFrame(image)
+          +            }
+           
+                       // Log periodically (every 30 frames = ~1 second at 30fps)
+                       Task { @MainActor in
+          --- a/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
+          +++ b/OpenVision/Views/VoiceAgent/VoiceAgentView.swift
+          @@ -72,6 +72,25 @@
+                                   .padding(.bottom, 28)
+                           }
+                           .transition(.move(edge: .bottom).combined(with: .opacity))
+          +            }
+          +
+          +            if viewModel.isLiveVideoMode {
+          +                VStack {
+          +                    HStack {
+          +                        Spacer()
+          +                        Button { viewModel.stopSession() } label: {
+          +                            Label("Durdur", systemImage: "stop.circle.fill")
+          +                                .font(.headline)
+          +                                .padding(12)
+          +                                .background(Capsule().fill(Color.red))
+          +                                .foregroundColor(.white)
+          +                        }
+          +                        .accessibilityLabel("Konuşmayı ve kamerayı durdur")
+          +                    }
+          +                    .padding(.horizontal)
+          +                    .padding(.top, 64)
+          +                    Spacer()
+          +                }
+                       }
+           
+                       // Error overlay
+          @@ -217,7 +236,7 @@
+                                   Text(settingsManager.settings.backendDisplayName)
+                                       .font(.headline)
+                                       .foregroundColor(Theme.heading)
+          -                        Text("Say \"stop video\" to exit")
+          +                        Text("Bitirmek için \"Dur\" de veya Durdur’a dokun")
+                                       .font(.caption)
+                                       .foregroundColor(Theme.textSecondary)
+                               }
+          @@ -244,8 +263,34 @@
+                       .transition(.opacity)
+           
+                       // The assistant identity: swirling emerald orb (tap to start/stop a session)
+          -            SwirlOrb(mode: orbMode, size: 250)
+          -                .onTapGesture { viewModel.toggleSession() }
+          +            if viewModel.isLiveVideoMode {
+          +                TimelineView(.periodic(from: .now, by: 1)) { context in
+          +                    VStack(spacing: 6) {
+          +                        if let frame = glassesManager.lastFrame,
+          +                           context.date.timeIntervalSince(glassesManager.lastFrameTime) < 3 {
+          +                            Image(uiImage: frame)
+          +                                .resizable()
+          +                                .scaledToFit()
+          +                                .frame(maxWidth: 220, maxHeight: 145)
+          +                                .clipShape(RoundedRectangle(cornerRadius: 14))
+          +                            Text("Gözlüğün görüntüsü")
+          +                                .font(.caption).foregroundColor(Theme.textSecondary)
+          +                        } else {
+          +                            Label("Gözlükten görüntü gelmiyor", systemImage: "video.slash")
+          +                                .font(.caption).foregroundColor(.orange)
+          +                        }
+          +                        if settingsManager.settings.aiBackend == .geminiLive {
+          +                            Text(context.date.timeIntervalSince(viewModel.lastLiveFrameSentAt) < 3
+          +                                 ? "Görüntü Gemini'ye gönderiliyor"
+          +                                 : "Gemini'ye görüntü gönderimi bekleniyor")
+          +                                .font(.caption2).foregroundColor(Theme.textSecondary)
+          +                        }
+          +                    }
+          +                }
+          +            } else {
+          +                SwirlOrb(mode: orbMode, size: 250)
+          +                    .onTapGesture { viewModel.toggleSession() }
+          +            }
+           
+                       // Status text
+                       Text(viewModel.agentState.displayText)
+          --- a/OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          +++ b/OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          @@ -40,6 +40,9 @@
+               var onOutputTranscription: ((String) -> Void)?
+               var onConnectionStateChanged: ((AIConnectionState) -> Void)?
+               var onDisconnected: (() -> Void)?
+          +    var onInterrupted: (() -> Void)?
+          +    var onVideoFrameSent: (() -> Void)?
+          +    var onVideoFrameError: (() -> Void)?
+           
+               // MARK: - WebSocket
+           
+          @@ -52,7 +55,7 @@
+           
+               private var lastFrameTime: Date = .distantPast
+               private var frameInterval: TimeInterval {
+          -        1.0 / Double(videoFPS)
+          +        1.0  // Gemini Live accepts at most one video frame per second.
+               }
+           
+               // MARK: - Latency Tracking
+          @@ -163,6 +166,7 @@
+                   urlSession = nil
+           
+                   isSetupComplete = false
+          +        lastFrameTime = .distantPast
+                   isModelSpeaking = false
+               }
+           
+          @@ -247,7 +251,8 @@
+           
+               /// Send audio data to Gemini
+               func sendAudio(data: Data) {
+          -        guard connectionState.isUsable, !isModelSpeaking else { return }
+          +        // Keep sending while the model speaks, so VAD can hear "dur" / interruptions.
+          +        guard connectionState.isUsable else { return }
+           
+                   let message: [String: Any] = [
+                       "realtimeInput": [
+          @@ -320,8 +325,16 @@
+                       ]
+                   ]
+           
+          +        let sessionSocket = webSocket
+                   Task {
+          -            try? await sendJSON(message)
+          +            do {
+          +                try await sendJSON(message)
+          +                guard webSocket === sessionSocket, connectionState.isUsable else { return }
+          +                onVideoFrameSent?()
+          +            } catch {
+          +                guard webSocket === sessionSocket, connectionState.isUsable else { return }
+          +                onVideoFrameError?()
+          +            }
+                   }
+               }
+           
+          @@ -411,23 +424,16 @@
+           
+               /// Handle server content
+               private func handleServerContent(_ content: [String: Any]) {
+          -        // Check if turn complete
+          -        if content["turnComplete"] as? Bool == true {
+          +        // Flags can share a message with transcription; never discard that text.
+          +        let interrupted = content["interrupted"] as? Bool == true
+          +        if interrupted {
+                       isModelSpeaking = false
+                       isProcessing = false
+          -            onTurnComplete?()
+          -            return
+          -        }
+          -
+          -        // Check if interrupted
+          -        if content["interrupted"] as? Bool == true {
+          -            isModelSpeaking = false
+          -            isProcessing = false
+          -            return
+          +            onInterrupted?()
+                   }
+           
+                   // Model turn
+          -        if let modelTurn = content["modelTurn"] as? [String: Any],
+          +        if !interrupted, let modelTurn = content["modelTurn"] as? [String: Any],
+                      let parts = modelTurn["parts"] as? [[String: Any]] {
+           
+                       for part in parts {
+          @@ -459,6 +465,15 @@
+                   if let inputTranscription = content["inputTranscription"] as? [String: Any],
+                      let text = inputTranscription["text"] as? String {
+                       onInputTranscription?(text)
+          +        }
+          +        if let output = content["outputTranscription"] as? [String: Any],
+          +           let text = output["text"] as? String {
+          +            onOutputTranscription?(text)
+          +        }
+          +        if content["turnComplete"] as? Bool == true {
+          +            isModelSpeaking = false
+          +            isProcessing = false
+          +            onTurnComplete?()
+                   }
+               }
+           
+          --- /dev/null
+          +++ b/OpenVision/Services/Voice/LiveStopCommand.swift
+          @@ -0,0 +1,38 @@
+          +import Foundation
+          +
+          +/// Live transcripts may arrive as word fragments or as a cumulative utterance.
+          +/// Only explicit control phrases stop the session, not substrings ("durum", "stopwatch").
+          +struct LiveStopCommand {
+          +    private(set) var transcript = ""
+          +    private var lastUpdate = Date.distantPast
+          +
+          +    mutating func reset() {
+          +        transcript = ""
+          +        lastUpdate = .distantPast
+          +    }
+          +
+          +    mutating func consume(_ text: String, at now: Date = Date()) -> Bool {
+          +        if now.timeIntervalSince(lastUpdate) > 4 { transcript = "" }
+          +        lastUpdate = now
+          +        if transcript.isEmpty || text.hasPrefix(transcript) {
+          +            transcript = text
+          +        } else {
+          +            transcript += text
+          +        }
+          +        transcript = String(transcript.suffix(500))
+          +        let normalized = transcript.lowercased(with: Locale(identifier: "tr_TR"))
+          +            .folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US"))
+          +            .replacingOccurrences(of: "ı", with: "i")
+          +            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+          +            .filter { !$0.isEmpty }.joined(separator: " ")
+          +        let exact = ["dur", "dur dur", "lutfen dur", "dur lutfen", "sus", "yeter",
+          +                     "stop", "stop please", "please stop"]
+          +        if exact.contains(normalized) { return true }
+          +        let phrases = ["konusmayi durdur", "konusmayi bitir", "sohbeti bitir",
+          +                       "videoyu durdur", "kamerayi kapat", "dinlemeyi durdur",
+          +                       "stop video", "stop streaming", "stop live", "end video",
+          +                       "exit video", "disable video", "stop the video", "end live",
+          +                       "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
+          +        return phrases.contains { (" " + normalized + " ").contains(" " + $0 + " ") }
+          +    }
+          +}
           WAKE_PATCH
+          xcodegen generate
           xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
+          xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentView.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/Voice/LiveStopCommand.swift
+          cat > build/live-control-tests.swift <<'LIVE_TESTS'
+          import Foundation
+          
+          @main
+          struct LiveControlTests {
+              static func main() {
+                  for phrase in ["dur", "DUR!", "Lütfen dur.", "Konuşmayı bitir", "konuşmayı durdur",
+                                 "kamerayı kapat", "Stop video", "please stop streaming"] {
+                      var matcher = LiveStopCommand()
+                      precondition(matcher.consume(phrase), "Missed control: \(phrase)")
+                  }
+                  for phrase in ["durum nasıl", "durdurma", "stopwatch",
+                                 "Durak nerede?", "Bir dur bakalım ne olmuş", "konuşmayı bitirme"] {
+                      var matcher = LiveStopCommand()
+                      precondition(!matcher.consume(phrase), "False stop: \(phrase)")
+                  }
+                  var matcher = LiveStopCommand()
+                  precondition(!matcher.consume("konuş"))
+                  precondition(matcher.consume("mayı bitir"))
+                  matcher.reset()
+                  precondition(!matcher.consume("please "))
+                  precondition(matcher.consume("stop video"))
+                  matcher.reset()
+                  precondition(!matcher.consume("kamerayı"))
+                  precondition(matcher.consume("kamerayı kapat"))
+                  matcher.reset()
+                  let now = Date()
+                  precondition(!matcher.consume("konuşmayı ", at: now))
+                  precondition(!matcher.consume("bitir", at: now.addingTimeInterval(5)))
+                  print("PASS: Turkish / English commands, fragments, cumulative text, false matches, and expiry")
+              }
+          }
+          LIVE_TESTS
+          xcrun swiftc -parse-as-library OpenVision/Services/Voice/LiveStopCommand.swift build/live-control-tests.swift -o build/live-control-tests
+          ./build/live-control-tests
 
       - name: iPhone uygulamasini imzasiz derle
         shell: bash
@@ -688,7 +1413,7 @@ jobs:
             CODE_SIGN_IDENTITY= \
             CODE_SIGN_ENTITLEMENTS= \
             DEVELOPMENT_TEAM= \
-            CURRENT_PROJECT_VERSION=2 \
+            CURRENT_PROJECT_VERSION=3 \
             build 2>&1 | tee build/xcodebuild.log
 
       - name: Windows icin IPA dosyasini paketle
