@@ -106,7 +106,7 @@ jobs:
                // MARK: - Initialization
            
                init() {
-          +        if AppLaunchConfiguration.isUITesting { return }
+          +        if AppLaunchConfiguration.isTesting { return }
                    // Show timer/alarm notifications even when the app is in the foreground.
                    NotificationForegroundPresenter.shared.register()
                    // Create the location manager on the main thread + warm the cache for contextual notes.
@@ -115,7 +115,7 @@ jobs:
                    WindowGroup {
                        Group {
           -                if hasCompletedOnboarding {
-          +                if hasCompletedOnboarding || AppLaunchConfiguration.isUITesting {
+          +                if hasCompletedOnboarding || AppLaunchConfiguration.isTesting {
                                MainTabView()
                                    .environmentObject(settingsManager)
                                    .environmentObject(glassesManager)
@@ -132,17 +132,27 @@ jobs:
                            // Telemetry settings persist, but the sink lives in memory — without this a
                            // relaunch (or a jetsam kill during a model switch) silently stopped pushing.
           -                MetricsCollector.shared.restoreAtLaunch()
-          +                if !AppLaunchConfiguration.isUITesting { MetricsCollector.shared.restoreAtLaunch() }
+          +                if !AppLaunchConfiguration.isTesting { MetricsCollector.shared.restoreAtLaunch() }
                        }
                        .onOpenURL { url in
                            handleURL(url)
           --- a/OpenVision/Managers/GlassesManager.swift
           +++ b/OpenVision/Managers/GlassesManager.swift
-          @@ -74,6 +74,7 @@
+          @@ -44,7 +44,8 @@
+           
+               // MARK: - Private Properties
+           
+          -    private let wearables = Wearables.shared
+          +    // Access only after the app has configured the SDK. Test launches don't use hardware.
+          +    private var wearables: any WearablesInterface { Wearables.shared }
+               // 0.9.0 camera lifecycle: DeviceSession owns the device link, Camera owns the camera
+               // hardware, camera.stream carries frames. Stopping the camera cascades to the stream.
+               private var deviceSession: DeviceSession?
+          @@ -74,6 +75,7 @@
            
                private init() {
                    print("[GlassesManager] Initializing")
-          +        guard !AppLaunchConfiguration.isUITesting else { return }
+          +        guard !AppLaunchConfiguration.isTesting else { return }
                    setupRegistrationListener()
                    setupDevicesListener()
                }
@@ -173,6 +183,16 @@ jobs:
            
                /// Whether wake word detection is enabled (OpenClaw mode only)
                var wakeWordEnabled: Bool = true
+          @@ -170,6 +170,9 @@
+           
+               // MARK: - Advanced Settings
+           
+          +    /// Separate opt-in: never starts location tracking on launch or just by saving a setting.
+          +    var guideAutomaticNarration: Bool = false
+          +
+               /// Auto-reconnect on connection drop
+               var autoReconnect: Bool = true
+           
           --- /dev/null
           +++ b/OpenVision/Models/AssistantPresentation.swift
           @@ -0,0 +1,52 @@
@@ -225,6 +245,60 @@ jobs:
           +        case .listening, .live: return "waveform"
           +        case .thinking, .toolRunning: return "ellipsis.bubble"
           +        case .speaking: return "speaker.wave.2"
+          +        }
+          +    }
+          +}
+          --- /dev/null
+          +++ b/OpenVision/Models/GuidePolicy.swift
+          @@ -0,0 +1,51 @@
+          +import Foundation
+          +
+          +/// Pure rules shared by GPS updates and the UI; no network or microphone required.
+          +struct GuidePolicy {
+          +    private(set) var narratedIDs: Set<String> = []
+          +    private(set) var lastNarration = Date.distantPast
+          +    static func acceptsFix(age: TimeInterval, accuracy: Double, speed: Double) -> Bool {
+          +        age.isFinite && age >= -5 && age <= 90 && accuracy.isFinite && accuracy >= 0 && accuracy <= 100
+          +            && speed.isFinite && speed <= 3.5
+          +    }
+          +    func mayNarrate(id: String, distance: Double, now: Date, busy: Bool) -> Bool {
+          +        !busy && distance.isFinite && distance >= 0 && distance <= 300
+          +            && !narratedIDs.contains(id) && narratedIDs.count < 50
+          +            && now.timeIntervalSince(lastNarration) >= 90
+          +    }
+          +    mutating func didNarrate(id: String, now: Date) {
+          +        narratedIDs.insert(id)
+          +        lastNarration = now
+          +    }
+          +    mutating func reset() { self = GuidePolicy() }
+          +}
+          +
+          +struct GuidePlace: Identifiable, Equatable {
+          +    let id: String
+          +    let title: String
+          +    let summary: String
+          +    let latitude: Double
+          +    let longitude: Double
+          +    var sourceURL: URL { URL(string: "https://tr.wikipedia.org/?curid=\(id)")! }
+          +}
+          +
+          +enum GuideSourceParser {
+          +    static func places(from data: Data) throws -> [GuidePlace] {
+          +        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          +              root["error"] == nil else { throw CocoaError(.coderReadCorrupt) }
+          +        guard let query = root["query"] as? [String: Any] else { return [] }
+          +        guard let pages = query["pages"] as? [[String: Any]] else { throw CocoaError(.coderReadCorrupt) }
+          +        return pages.compactMap { page in
+          +            guard let id = page["pageid"] as? Int, id > 0,
+          +                  let title = page["title"] as? String, !title.isEmpty,
+          +                  let extract = page["extract"] as? String,
+          +                  let coordinates = page["coordinates"] as? [[String: Any]],
+          +                  let coordinate = coordinates.first,
+          +                  let lat = coordinate["lat"] as? Double, lat.isFinite, (-90...90).contains(lat),
+          +                  let lon = coordinate["lon"] as? Double, lon.isFinite, (-180...180).contains(lon) else { return nil }
+          +            let text = extract.trimmingCharacters(in: .whitespacesAndNewlines)
+          +            guard !text.isEmpty else { return nil }
+          +            return GuidePlace(id: String(id), title: title, summary: String(text.prefix(700)), latitude: lat, longitude: lon)
           +        }
           +    }
           +}
@@ -281,6 +355,38 @@ jobs:
           +    "version": 1
              }
            }
+          --- a/OpenVision/Resources/Info.plist
+          +++ b/OpenVision/Resources/Info.plist
+          @@ -78,6 +78,7 @@
+               <key>UIBackgroundModes</key>
+               <array>
+                   <string>audio</string>
+          +        <string>location</string>
+                   <string>fetch</string>
+                   <string>processing</string>
+                   <string>bluetooth-central</string>
+          @@ -121,7 +122,7 @@
+           
+               <!-- Location (if needed for context) -->
+               <key>NSLocationWhenInUseUsageDescription</key>
+          -    <string>OpenVision can use your location to provide location-aware responses.</string>
+          +    <string>Canlı rehber, başlattığın gezi boyunca iPhone konumunu yakındaki yerleri bulmak için kullanır. Geziyi durdurunca konum takibi biter.</string>
+           
+               <!-- Productivity tools -->
+               <key>NSCalendarsUsageDescription</key>
+          @@ -156,12 +157,8 @@
+               </dict>
+           
+               <!-- Appearance -->
+          -    <key>UIUserInterfaceStyle</key>
+          -    <string>Dark</string>
+           
+               <!-- Status Bar -->
+          -    <key>UIStatusBarStyle</key>
+          -    <string>UIStatusBarStyleLightContent</string>
+               <key>UIViewControllerBasedStatusBarAppearance</key>
+               <true/>
+           </dict>
           --- a/OpenVision/Services/Audio/AudioCaptureService.swift
           +++ b/OpenVision/Services/Audio/AudioCaptureService.swift
           @@ -20,6 +20,32 @@
@@ -761,12 +867,16 @@ jobs:
                    isModelSpeaking = false
                }
            
-          @@ -208,7 +215,11 @@
+          @@ -208,7 +215,15 @@
                private func buildSystemPrompt() -> String {
                    let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
                    var prompt = """
           -        You are a helpful AI assistant integrated with smart glasses. You can see what the user sees through their glasses camera.
           +        You are Jarvis, a helpful voice assistant integrated with smart glasses. Reply in Turkish by default.
+          +        When the user asks "burayı anlat", nearby sights, or city history, call city_guide.
+          +        It returns sourced location context only after the user starts a guide walk.
+          +        Never guess a location or which building they are looking at from GPS.
+          +        Speak only from the returned source and admit missing information.
           +        The camera is normally OFF. Never claim to see a current scene without a newly supplied image.
           +        When the user says "Ne görüyorsun?", "Buna bak" or "Bunu oku", the app will briefly capture
           +        and send an image with the question. Wait for that image before describing anything.
@@ -774,7 +884,7 @@ jobs:
            
                    Keep responses concise and conversational - the user is wearing glasses and expects quick, natural interactions.
            
-          @@ -247,7 +258,8 @@
+          @@ -247,7 +262,8 @@
            
                /// Send audio data to Gemini
                func sendAudio(data: Data) {
@@ -784,7 +894,7 @@ jobs:
            
                    let message: [String: Any] = [
                        "realtimeInput": [
-          @@ -291,6 +303,19 @@
+          @@ -291,6 +307,19 @@
                    try await sendJSON(message)
                }
            
@@ -804,7 +914,7 @@ jobs:
                /// Interrupt the AI (barge-in support)
                func interrupt() async {
                    // Send interrupt signal if model is speaking
-          @@ -320,8 +345,16 @@
+          @@ -320,8 +349,16 @@
                        ]
                    ]
            
@@ -822,7 +932,7 @@ jobs:
                    }
                }
            
-          @@ -411,23 +444,16 @@
+          @@ -411,23 +448,16 @@
            
                /// Handle server content
                private func handleServerContent(_ content: [String: Any]) {
@@ -851,7 +961,7 @@ jobs:
                       let parts = modelTurn["parts"] as? [[String: Any]] {
            
                        for part in parts {
-          @@ -459,6 +485,15 @@
+          @@ -459,6 +489,15 @@
                    if let inputTranscription = content["inputTranscription"] as? [String: Any],
                       let text = inputTranscription["text"] as? String {
                        onInputTranscription?(text)
@@ -867,6 +977,231 @@ jobs:
                    }
                }
            
+          --- /dev/null
+          +++ b/OpenVision/Services/NativeTools/CityGuideService.swift
+          @@ -0,0 +1,212 @@
+          +import Foundation
+          +import CoreLocation
+          +import AVFoundation
+          +
+          +/// A walk is explicitly started and never restored after launch. No route is stored.
+          +@MainActor
+          +final class CityGuideService: NSObject, ObservableObject, CLLocationManagerDelegate, AVSpeechSynthesizerDelegate {
+          +    static let shared = CityGuideService()
+          +    @Published private(set) var isActive = false
+          +    @Published private(set) var isSpeaking = false
+          +    @Published private(set) var places: [GuidePlace] = []
+          +    @Published private(set) var status = "Geziyi başlatınca yakındaki yerler burada görünür."
+          +    @Published private(set) var accuracy: Double?
+          +    var canNarrate: (() -> Bool)?
+          +    private lazy var location = CLLocationManager()
+          +    private let speech = AVSpeechSynthesizer()
+          +    private var policy = GuidePolicy()
+          +    private var fix: CLLocation?
+          +    private var lastSearchFix: CLLocation?
+          +    private var lastSearchAt = Date.distantPast
+          +    private var searchTask: Task<Void, Never>?
+          +    private var sessionID = UUID()
+          +    private override init() {
+          +        super.init()
+          +        speech.delegate = self
+          +    }
+          +
+          +    func start() {
+          +        guard !isActive, !AppLaunchConfiguration.isTesting else { return }
+          +        isActive = true
+          +        sessionID = UUID()
+          +        policy.reset()
+          +        places = []
+          +        lastSearchFix = nil
+          +        lastSearchAt = .distantPast
+          +        location.delegate = self
+          +        location.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+          +        location.distanceFilter = 30
+          +        location.activityType = .fitness
+          +        location.pausesLocationUpdatesAutomatically = true
+          +        updateAuthorization()
+          +    }
+          +
+          +    func stop() {
+          +        isActive = false
+          +        sessionID = UUID()
+          +        searchTask?.cancel()
+          +        searchTask = nil
+          +        location.stopUpdatingLocation()
+          +        location.allowsBackgroundLocationUpdates = false
+          +        stopSpeaking()
+          +        fix = nil
+          +        accuracy = nil
+          +        places = []
+          +        policy.reset()
+          +        status = "Gezi durduruldu. Konum takibi kapalı."
+          +    }
+          +
+          +    func stopSpeaking() {
+          +        speech.stopSpeaking(at: .immediate)
+          +        isSpeaking = false
+          +    }
+          +
+          +    private func updateAuthorization() {
+          +        guard isActive else { return }
+          +        switch location.authorizationStatus {
+          +        case .notDetermined:
+          +            status = "Rehber için iPhone’un konum iznini bekliyorum."
+          +            location.requestWhenInUseAuthorization()
+          +        case .authorizedAlways, .authorizedWhenInUse:
+          +            // Info.plist declares location. Enabled only for an explicitly active walk.
+          +            location.allowsBackgroundLocationUpdates = true
+          +            location.showsBackgroundLocationIndicator = true
+          +            location.startUpdatingLocation()
+          +            status = "Güncel konum bekleniyor."
+          +        case .denied, .restricted:
+          +            isActive = false
+          +            sessionID = UUID()
+          +            searchTask?.cancel()
+          +            searchTask = nil
+          +            status = "Konum izni kapalı. iPhone Ayarları → OpenVision → Konum’dan izin verebilirsin."
+          +            location.stopUpdatingLocation()
+          +            location.allowsBackgroundLocationUpdates = false
+          +            stopSpeaking()
+          +            places = []
+          +            fix = nil
+          +            accuracy = nil
+          +        @unknown default:
+          +            status = "Konum izni alınamadı."
+          +        }
+          +    }
+          +    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) { updateAuthorization() }
+          +    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+          +        guard isActive else { return }
+          +        status = "Konum alınamadı. Yakındaki yerleri tahmin etmiyorum."
+          +    }
+          +    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+          +        guard isActive, let latest = locations.last else { return }
+          +        accuracy = latest.horizontalAccuracy
+          +        guard GuidePolicy.acceptsFix(age: Date().timeIntervalSince(latest.timestamp), accuracy: latest.horizontalAccuracy, speed: latest.speed) else {
+          +            status = "Konum hassas değil veya yürüyüş hızı aşıldı. Otomatik anlatım bekliyor."
+          +            fix = nil
+          +            return
+          +        }
+          +        fix = latest
+          +        narrateNearbyIfPossible()
+          +        let moved = lastSearchFix.map { latest.distance(from: $0) >= 100 } ?? true
+          +        guard searchTask == nil, moved || Date().timeIntervalSince(lastSearchAt) >= 90 else { return }
+          +        refresh(around: latest)
+          +    }
+          +
+          +    private func refresh(around center: CLLocation) {
+          +        let token = sessionID
+          +        lastSearchAt = Date()
+          +        lastSearchFix = center
+          +        status = "Yakındaki Türkçe kaynaklar aranıyor…"
+          +        searchTask = Task { [weak self] in
+          +            do {
+          +                var url = URLComponents(string: "https://tr.wikipedia.org/w/api.php")!
+          +                let parameters = ["action":"query", "format":"json", "formatversion":"2",
+          +                    "generator":"geosearch", "ggscoord":"\(center.coordinate.latitude)|\(center.coordinate.longitude)",
+          +                    "ggsradius":"1000", "ggslimit":"10", "ggsnamespace":"0",
+          +                    "prop":"coordinates|extracts", "exintro":"1", "explaintext":"1", "exchars":"650", "exlimit":"10"]
+          +                url.queryItems = parameters.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+          +                var request = URLRequest(url: url.url!, timeoutInterval: 12)
+          +                request.setValue("OpenVisionCityGuide/3.0 (https://github.com/rayl15/OpenVision)", forHTTPHeaderField: "User-Agent")
+          +                let (data, response) = try await URLSession.shared.data(for: request)
+          +                try Task.checkCancellation()
+          +                guard let http = response as? HTTPURLResponse, http.statusCode == 200, data.count <= 1_000_000 else {
+          +                    throw URLError(.badServerResponse)
+          +                }
+          +                let results = try GuideSourceParser.places(from: data)
+          +                guard let self, self.isActive, self.sessionID == token else { return }
+          +                self.places = results.filter { self.distance(to: $0).map { $0 <= 1000 } ?? false }
+          +                    .sorted { (self.distance(to: $0) ?? .infinity) < (self.distance(to: $1) ?? .infinity) }
+          +                self.status = self.places.isEmpty ? "Yakında Türkçe kaynak bulunamadı. Yer veya tarih bilgisi uydurmuyorum." : "Kaynak: Türkçe Wikipedia. Konum hangi yöne baktığını göstermez."
+          +                self.searchTask = nil
+          +                self.narrateNearbyIfPossible()
+          +            } catch {
+          +                guard let self, self.isActive, self.sessionID == token, !Task.isCancelled else { return }
+          +                self.searchTask = nil
+          +                self.status = "Rehber kaynağına ulaşılamadı. İnternet bağlantısını kontrol et."
+          +            }
+          +        }
+          +    }
+          +
+          +    func distance(to place: GuidePlace) -> Double? {
+          +        guard let fix, GuidePolicy.acceptsFix(age: Date().timeIntervalSince(fix.timestamp), accuracy: fix.horizontalAccuracy, speed: fix.speed) else { return nil }
+          +        return fix.distance(from: CLLocation(latitude: place.latitude, longitude: place.longitude))
+          +    }
+          +
+          +    private func narrateNearbyIfPossible() {
+          +        guard SettingsManager.shared.settings.guideAutomaticNarration else { return }
+          +        guard let nearest = places.first(where: {
+          +            policy.mayNarrate(id: $0.id, distance: distance(to: $0) ?? .infinity, now: Date(), busy: isSpeaking || canNarrate?() != true)
+          +        }) else { return }
+          +        narrate(nearest)
+          +    }
+          +
+          +    func narrate(_ place: GuidePlace) {
+          +        guard isActive, let meters = distance(to: place), meters <= 1000 else {
+          +            status = "Anlatım için güncel ve hassas bir konum gerekiyor."
+          +            return
+          +        }
+          +        guard !isSpeaking, canNarrate?() == true else {
+          +            status = "Asistan konuşması bitince yeniden anlatmayı deneyebilirsin."
+          +            return
+          +        }
+          +        do {
+          +            // Do not reconfigure an existing Bluetooth/microphone route.
+          +            if AudioSessionManager.shared.currentMode == .inactive { try AudioSessionManager.shared.configure(for: .measurement) }
+          +        } catch { status = "Ses hazırlanamadı: \(error.localizedDescription)"; return }
+          +        let rounded = Int((meters / 10).rounded()) * 10
+          +        let utterance = AVSpeechUtterance(string: "Yaklaşık \(rounded) metre yakınında \(place.title) var. Wikipedia’ya göre: \(place.summary)")
+          +        utterance.voice = AVSpeechSynthesisVoice(language: "tr-TR")
+          +        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+          +        isSpeaking = true
+          +        policy.didNarrate(id: place.id, now: Date())
+          +        speech.speak(utterance)
+          +    }
+          +
+          +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +    }
+          +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +    }
+          +
+          +    func context() -> String {
+          +        guard isActive else { return "Canlı rehber kapalı. Rehber sekmesinden geziyi başlat. Kullanıcının konumunu tahmin etme." }
+          +        let nearby = places.compactMap { place -> String? in
+          +            guard let distance = distance(to: place), distance <= 1000 else { return nil }
+          +            return "\(place.title), yaklaşık \(Int(distance)) metre: \(place.summary) Kaynak: \(place.sourceURL.absoluteString)"
+          +        }
+          +        guard !nearby.isEmpty else { return status + " Kullanıcının baktığı binayı veya tarihini tahmin etme." }
+          +        return "Aşağıdakiler konuma yakın kaynak maddeleridir; kullanıcının baktığı yer kesin değildir. Güncel fiyat ve çalışma saati içermez. Türkçe, kısa cevap ver; yalnızca bu metindeki tarih bilgisine dayan.\n" + nearby.prefix(3).joined(separator: "\n")
+          +    }
+          +}
+          +
+          +struct CityGuideTool: NativeTool {
+          +    let name = "city_guide"
+          +    let description = "Get sourced Turkish information about places near the user's iPhone, only during an explicitly started city-guide walk. Use for 'burayı anlat', nearby sights, history, and city-guide questions. Never infer the user's view from GPS."
+          +    let parametersSchema: [String: Any] = ["type":"object", "properties":[
+          +        "action": ["type":"string", "enum":["context", "stop"], "description":"context: nearby sourced facts; stop: stop the walk and location tracking"]], "required":[]]
+          +    func execute(args: [String: Any]) async throws -> String {
+          +        if args["action"] as? String == "stop" {
+          +            await CityGuideService.shared.stop()
+          +            return "Gezi durduruldu. Konum takibi kapalı."
+          +        }
+          +        return await CityGuideService.shared.context()
+          +    }
+          +}
+          --- a/OpenVision/Services/NativeTools/NativeTool.swift
+          +++ b/OpenVision/Services/NativeTools/NativeTool.swift
+          @@ -56,6 +56,7 @@
+                       ReminderTool(),
+                       CalendarTool(),
+                       ContextualNoteTool(),
+          +            CityGuideTool(),
+                       ClipboardTool(),
+                       DocumentSearchTool(),
+                   ]
           --- a/OpenVision/Services/OpenAIRealtime/OpenAIRealtimeService.swift
           +++ b/OpenVision/Services/OpenAIRealtime/OpenAIRealtimeService.swift
           @@ -90,6 +90,7 @@
@@ -1271,10 +1606,19 @@ jobs:
                            break
           --- /dev/null
           +++ b/OpenVision/Testing/InterfaceTestSupport.swift
-          @@ -0,0 +1,40 @@
+          @@ -0,0 +1,49 @@
           +import SwiftUI
           +
           +enum AppLaunchConfiguration {
+          +    static var isTesting: Bool {
+          +        #if DEBUG
+          +        return isUITesting || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+          +            || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
+          +            || NSClassFromString("XCTestCase") != nil
+          +        #else
+          +        return false
+          +        #endif
+          +    }
           +    static var isUITesting: Bool {
           +        #if DEBUG
           +        return ProcessInfo.processInfo.arguments.contains("--ui-testing")
@@ -1994,6 +2338,65 @@ jobs:
           -    /// Frosted card fill.
           -    static let glass = Color.white.opacity(0.05)
            }
+          --- /dev/null
+          +++ b/OpenVision/Views/Guide/CityGuideView.swift
+          @@ -0,0 +1,56 @@
+          +import SwiftUI
+          +
+          +struct CityGuideView: View {
+          +    @ObservedObject private var guide = CityGuideService.shared
+          +    @EnvironmentObject var settingsManager: SettingsManager
+          +    @State private var showConsent = false
+          +    var body: some View {
+          +        NavigationStack {
+          +            List {
+          +                Section {
+          +                    Label("Şehri Jarvis ile keşfet", systemImage: "figure.walk")
+          +                        .font(.headline)
+          +                    Text(guide.status).foregroundStyle(.secondary)
+          +                        .accessibilityIdentifier("guide.status")
+          +                    if let accuracy = guide.accuracy, accuracy.isFinite, accuracy >= 0 {
+          +                        LabeledContent("Konum hassasiyeti", value: "Yaklaşık \(Int(accuracy)) m")
+          +                    }
+          +                    Button(guide.isActive ? "Geziyi durdur" : "Geziyi başlat", role: guide.isActive ? .destructive : nil) {
+          +                        if guide.isActive { guide.stop() } else { showConsent = true }
+          +                    }.accessibilityIdentifier("guide.toggle")
+          +                    if guide.isSpeaking { Button("Anlatımı durdur", role: .destructive) { guide.stopSpeaking() } }
+          +                }
+          +                Section {
+          +                    Toggle("Otomatik anlatım", isOn: $settingsManager.settings.guideAutomaticNarration)
+          +                } footer: {
+          +                    Text("300 metre yakındaki yeni bir nokta anlatılır. Aynı yer gezi boyunca tekrar anlatılmaz; anlatımlar arasında en az 90 saniye beklenir.")
+          +                }
+          +                Section("Yakındaki yerler") {
+          +                    if guide.places.isEmpty { Text("Güncel konum ve internet bağlantısı gerekiyor.").foregroundStyle(.secondary) }
+          +                    ForEach(guide.places) { place in
+          +                        VStack(alignment: .leading, spacing: 10) {
+          +                            Text(place.title).font(.headline)
+          +                            if let meters = guide.distance(to: place) { Text("Yaklaşık \(Int(meters)) metre").font(.subheadline).foregroundStyle(.secondary) }
+          +                            Text(place.summary).textSelection(.enabled)
+          +                            Button("Bu yeri anlat") { guide.narrate(place) }
+          +                            Link("Wikipedia’da oku", destination: place.sourceURL)
+          +                                .font(.footnote)
+          +                        }.padding(.vertical, 6)
+          +                    }
+          +                }
+          +                Section {
+          +                    Text("Konum iPhone’dan gelir. Kamera açılmaz. Konum hangi binaya baktığını kesin göstermez. Türkçe kaynak kapsamı şehre göre değişir; bu ilk sürüm bilet fiyatı, açık saatler veya rota tarifi vermez.")
+          +                } header: { Text("Rehber hakkında") } footer: {
+          +                    Text("Özetler Wikipedia’dan, CC BY-SA lisansı altında alınır. Kaynağı her yerin altında bulabilirsin. Gezi rotası uygulamada kaydedilmez.")
+          +                }
+          +            }
+          +            .navigationTitle("Canlı rehber")
+          +            .alert("Konumla rehberi başlat", isPresented: $showConsent) {
+          +                Button("Başlat") { guide.start() }
+          +                Button("Vazgeç", role: .cancel) {}
+          +            } message: {
+          +                Text("Gezi boyunca iPhone konumun yakındaki kaynakları bulmak için Wikipedia’ya gönderilir. Konum takibi ekran kilitlendiğinde de sürebilir ve pil tüketir. Geziyi durdurunca takip biter. Bu özellik ChatGPT API kredisi kullanmaz.")
+          +            }
+          +        }
+          +    }
+          +}
           --- a/OpenVision/Views/History/ConversationListView.swift
           +++ b/OpenVision/Views/History/ConversationListView.swift
           @@ -27,8 +27,13 @@
@@ -2076,7 +2479,7 @@ jobs:
                            Text(message.timestamp.formatted(date: .omitted, time: .shortened))
           --- a/OpenVision/Views/MainTabView.swift
           +++ b/OpenVision/Views/MainTabView.swift
-          @@ -1,94 +1,24 @@
+          @@ -1,94 +1,26 @@
           -// OpenVision - MainTabView.swift
           -// Main tab navigation: Voice Agent, History, Settings
           -
@@ -2113,6 +2516,8 @@ jobs:
           +                .tabItem { Label("Asistan", systemImage: "waveform") }.tag(0)
           +            ConversationListView()
           +                .tabItem { Label("Geçmiş", systemImage: "clock") }.tag(1)
+          +            CityGuideView()
+          +                .tabItem { Label("Rehber", systemImage: "map") }.tag(3)
           +            SettingsView()
           +                .tabItem { Label("Ayarlar", systemImage: "gearshape") }.tag(2)
                    }
@@ -2173,7 +2578,7 @@ jobs:
           -        }
           +    @ViewBuilder private var voiceContent: some View {
           +        #if DEBUG
-          +        if AppLaunchConfiguration.isUITesting { AssistantInterfaceTestView() }
+          +        if AppLaunchConfiguration.isTesting { AssistantInterfaceTestView() }
           +        else { VoiceAgentView() }
           +        #else
           +        VoiceAgentView()
@@ -3205,7 +3610,7 @@ jobs:
                @Published var agentState: AgentState = .idle
                @Published var userTranscript = ""
                @Published var aiTranscript = ""
-          @@ -50,6 +54,16 @@
+          @@ -50,6 +54,17 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
@@ -3219,10 +3624,11 @@ jobs:
           +    private var snapshotRequestedThisTurn = false
           +    private var liveMicrophoneWatchdog: Timer?
           +    private var lastLiveMicrophoneBufferAt = Date.distantPast
+          +    private var lastLiveConversationAt = Date.distantPast
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -88,7 +102,7 @@
+          @@ -88,7 +103,7 @@
                        case .thinking: return "Thinking..."
                        case .speaking: return "Speaking..."
                        case .toolRunning: return "Running tool..."
@@ -3231,7 +3637,22 @@ jobs:
                        }
                    }
            
-          @@ -120,12 +134,22 @@
+          @@ -108,6 +123,14 @@
+               // MARK: - View lifecycle
+           
+               func onAppear() {
+          +        CityGuideService.shared.canNarrate = { [weak self] in
+          +            guard let self else { return false }
+          +            return !self.isChangingLiveMode && !self.isStoppingSession
+          +                && !self.commandTurnActive && self.agentState != .thinking && self.agentState != .connecting
+          +                && !self.ttsService.isSpeaking && !KokoroTTSService.shared.isSpeaking
+          +                && !self.audioPlayback.isPlaying
+          +                && (!self.isLiveVideoMode || Date().timeIntervalSince(self.lastLiveConversationAt) >= 12)
+          +        }
+                   setupVoiceCommandService()
+                   setupGlassesCallbacks()
+                   preloadLocalModelIfNeeded()
+          @@ -120,12 +143,22 @@
                }
            
                func onDisappear() {
@@ -3255,7 +3676,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +207,12 @@
+          @@ -183,6 +216,12 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -3268,7 +3689,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +284,7 @@
+          @@ -254,6 +293,7 @@
                }
            
                func startSession() {
@@ -3276,7 +3697,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +293,16 @@
+          @@ -262,6 +302,16 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -3293,7 +3714,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -276,7 +317,8 @@
+          @@ -276,7 +326,8 @@
                    configureAudioForGlasses()
            
                    // Connect to AI backend
@@ -3303,7 +3724,7 @@ jobs:
                        do {
                            switch settingsManager.settings.aiBackend {
                            case .openClaw:
-          @@ -309,6 +351,8 @@
+          @@ -309,6 +360,8 @@
                                )
                            }
            
@@ -3312,7 +3733,7 @@ jobs:
                            agentState = .listening
                            userTranscript = ""
                            aiTranscript = ""
-          @@ -321,10 +365,14 @@
+          @@ -321,10 +374,14 @@
                                // Put in listening mode (not waiting for wake word)
                                voiceCommandService.enterConversationMode()
                            } else {
@@ -3330,10 +3751,11 @@ jobs:
                            errorMessage = "Failed to connect: \(error.localizedDescription)"
                            isSessionActive = false
                            agentState = .idle
-          @@ -382,14 +430,32 @@
+          @@ -382,14 +439,33 @@
                }
            
                func stopSession() {
+          +        CityGuideService.shared.stopSpeaking()
           +        guard !isStoppingSession else { return }
           +        sessionStartTask?.cancel()
           +        commandTask?.cancel()
@@ -3365,7 +3787,7 @@ jobs:
                        switch settingsManager.settings.aiBackend {
                        case .openClaw:
                            await OpenClawService.shared.disconnect()
-          @@ -439,6 +505,7 @@
+          @@ -439,6 +515,7 @@
                /// quiet back to wake-word listening. The recognizer buffer is already reset by
                /// VoiceCommandService (so the stale transcript can't re-fire); here we just halt + end the turn.
                private func performFullStop() {
@@ -3373,15 +3795,16 @@ jobs:
                    // "Ok Vision stop" is an interruption too: the user cut the reply off. Close the turn
                    // deterministically before stopping the engines — delivered-then-stopped turns finish
                    // here (markSpokeDone is gated on firstAudio); a stop mid-thinking leaves the turn open
-          @@ -533,6 +600,7 @@
+          @@ -533,6 +610,8 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
           +            guard !self.isChangingLiveMode, !self.isStoppingSession else { return }
+          +            CityGuideService.shared.stopSpeaking()
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -585,6 +653,11 @@
+          @@ -585,6 +664,11 @@
                            return
                        }
            
@@ -3393,7 +3816,7 @@ jobs:
                        self.userTranscript = command
                        // Suspend ambient narration for the WHOLE turn (through reply playback).
                        self.commandTurnActive = true
-          @@ -614,7 +687,8 @@
+          @@ -614,7 +698,8 @@
                        self.historyAwaitingReply = true
            
                        // Send command to AI backend
@@ -3403,7 +3826,7 @@ jobs:
                            await self.sendCommand(command)
                        }
                    }
-          @@ -692,7 +766,7 @@
+          @@ -692,7 +777,7 @@
                            }
                        }
                        backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
@@ -3412,7 +3835,7 @@ jobs:
                            if isProcessing {
                                self.agentState = .thinking
                                // New reply: reset the sentence-streaming cursor for a clean start.
-          @@ -793,8 +867,15 @@
+          @@ -793,8 +878,15 @@
                    }
                }
            
@@ -3428,12 +3851,18 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -815,13 +896,14 @@
+          @@ -815,13 +907,20 @@
            
                /// Send command to AI backend
                private func sendCommand(_ command: String) async {
           +        guard !Task.isCancelled, isSessionActive, !isStoppingSession else { return }
                    let lowerCommand = command.lowercased()
+          +
+          +        if ["rehberi durdur", "rehberi kapat", "geziyi durdur"].contains(where: lowerCommand.contains) {
+          +            CityGuideService.shared.stop()
+          +            speakResponse("Gezi durduruldu. Konum takibi kapalı.")
+          +            return
+          +        }
            
                    // Check for "stop" command - stops TTS and waits for next command.
                    // Matched on WORDS, not substrings: `.contains("stop")` treated "what's on the desktop"
@@ -3444,7 +3873,7 @@ jobs:
                    let stopPhrases = ["be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it"]
                    let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                                         || stopPhrases.contains { lowerCommand.contains($0) })
-          @@ -962,7 +1044,8 @@
+          @@ -962,7 +1061,8 @@
                            agentState = isSessionActive ? .listening : .idle
                        }
                    } catch {
@@ -3454,7 +3883,7 @@ jobs:
                        agentState = isSessionActive ? .listening : .idle
                    }
                }
-          @@ -970,13 +1053,16 @@
+          @@ -970,13 +1070,16 @@
                // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
@@ -3472,7 +3901,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,15 +1078,26 @@
+          @@ -992,15 +1095,26 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -3501,7 +3930,7 @@ jobs:
            
                    // Stop TTS if speaking
                    ttsService.stop()
-          @@ -1011,27 +1108,46 @@
+          @@ -1011,27 +1125,46 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -3562,7 +3991,7 @@ jobs:
                        return
                    }
            
-          @@ -1039,42 +1155,67 @@
+          @@ -1039,42 +1172,68 @@
                    setupLiveVideoCallbacks(service)
            
                    // Setup audio capture → live backend
@@ -3570,6 +3999,7 @@ jobs:
           +        audioCapture.onAudioCaptured = { [weak self, weak service] data in
           +            guard let self, self.isLiveVideoMode else { return }
           +            self.lastLiveMicrophoneBufferAt = Date()
+          +            guard !CityGuideService.shared.isSpeaking else { return }
                        service?.sendAudio(data: data)
                    }
            
@@ -3646,7 +4076,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1627,213 @@
+          @@ -1486,89 +1645,217 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -3892,6 +4322,8 @@ jobs:
                    service.onAudioReceived = { [weak self] data in
           -            self?.audioPlayback.playAudio(data: data)
           +            guard let self, self.isLiveVideoMode, !self.isCapturingSnapshot else { return }
+          +            CityGuideService.shared.stopSpeaking()
+          +            self.lastLiveConversationAt = Date()
           +            self.audioPlayback.playAudio(data: data)
                    }
            
@@ -3913,6 +4345,8 @@ jobs:
           -                if isStopCommand && self.isLiveVideoMode {
           -                    print("[VoiceAgent] Stop command detected in transcription: \(text)")
           +                guard self.isLiveVideoMode else { return }
+          +                CityGuideService.shared.stopSpeaking()
+          +                self.lastLiveConversationAt = Date()
           +                let shouldStop = self.liveStopCommand.consume(text)
           +                self.userTranscript = self.liveStopCommand.transcript
           +                if shouldStop {
@@ -3923,7 +4357,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1854,10 @@
+          @@ -1589,6 +1876,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -3934,7 +4368,7 @@ jobs:
                        }
                    }
            
-          @@ -1598,6 +1867,7 @@
+          @@ -1598,6 +1889,7 @@
                            guard let self else { return }
                            if self.isLiveVideoMode {
                                print("[VoiceAgent] Live backend disconnected unexpectedly")
@@ -3942,7 +4376,7 @@ jobs:
                                await self.stopLiveVideoMode()
                            }
                        }
-          @@ -1969,8 +2239,15 @@
+          @@ -1969,8 +2261,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -3960,7 +4394,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2538,21 @@
+          @@ -2261,3 +2560,21 @@
                    return result
                }
            }
@@ -4044,8 +4478,55 @@ jobs:
           +    }
           +}
           --- /dev/null
+          +++ b/OpenVisionTests/GuideSafetyTests.swift
+          @@ -0,0 +1,44 @@
+          +import XCTest
+          +@testable import OpenVision
+          +
+          +final class GuideSafetyTests: XCTestCase {
+          +    func testBadOrOldGPSNeverEnablesNarration() {
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 91, accuracy: 20, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: -6, accuracy: 20, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: -1, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: .nan, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: 120, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: 10, speed: 10))
+          +        XCTAssertTrue(GuidePolicy.acceptsFix(age: 1, accuracy: 10, speed: -1))
+          +    }
+          +    func testNarrationWaitsForSilenceDistanceAndCooldown() {
+          +        var policy = GuidePolicy()
+          +        let now = Date()
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: 20, now: now, busy: true))
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: .infinity, now: now, busy: false))
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: 301, now: now, busy: false))
+          +        XCTAssertTrue(policy.mayNarrate(id: "a", distance: 20, now: now, busy: false))
+          +        policy.didNarrate(id: "a", now: now)
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: 20, now: now.addingTimeInterval(100), busy: false))
+          +        XCTAssertFalse(policy.mayNarrate(id: "b", distance: 20, now: now.addingTimeInterval(89), busy: false))
+          +        XCTAssertTrue(policy.mayNarrate(id: "b", distance: 20, now: now.addingTimeInterval(90), busy: false))
+          +        policy.reset()
+          +        XCTAssertTrue(policy.mayNarrate(id: "a", distance: 20, now: now, busy: false))
+          +    }
+          +    func testSourceParserRejectsMissingCoordinatesEmptyAndInvalidData() throws {
+          +        let data = Data(#"{"query":{"pages":[{"pageid":1,"title":"Kule","extract":"Kaynak metni.","coordinates":[{"lat":41.0,"lon":29.0}]},{"pageid":2,"title":"Koordinatsız","extract":"Tahmin etme"},{"pageid":3,"title":"Hatalı","extract":"Metin","coordinates":[{"lat":200.0,"lon":29.0}]}]}}"#.utf8)
+          +        let places = try GuideSourceParser.places(from: data)
+          +        XCTAssertEqual(places.count, 1)
+          +        XCTAssertEqual(places[0].title, "Kule")
+          +        XCTAssertEqual(places[0].sourceURL.host, "tr.wikipedia.org")
+          +        XCTAssertEqual(try GuideSourceParser.places(from: Data("{}".utf8)), [])
+          +        XCTAssertThrowsError(try GuideSourceParser.places(from: Data(#"{"error":{"code":"badvalue"}}"#.utf8)))
+          +        XCTAssertThrowsError(try GuideSourceParser.places(from: Data("not json".utf8)))
+          +    }
+          +    @MainActor func testInactiveGuideNeverReturnsCachedLocation() async throws {
+          +        CityGuideService.shared.stop()
+          +        let result = try await CityGuideTool().execute(args: [:])
+          +        XCTAssertTrue(result.contains("kapalı"))
+          +        XCTAssertTrue(CityGuideService.shared.places.isEmpty)
+          +    }
+          +}
+          --- /dev/null
           +++ b/OpenVisionUITests/NativeInterfaceTests.swift
-          @@ -0,0 +1,96 @@
+          @@ -0,0 +1,108 @@
           +import XCTest
           +
           +final class NativeInterfaceTests: XCTestCase {
@@ -4141,6 +4622,18 @@ jobs:
           +        app.tabBars.buttons["Asistan"].tap()
           +        XCTAssertTrue(app.buttons["assistant.primary"].isHittable)
           +    }
+          +    func testGuideStartsOnlyAfterExplicitConsent() {
+          +        launch()
+          +        app.tabBars.buttons["Rehber"].tap()
+          +        XCTAssertTrue(app.buttons["guide.toggle"].waitForExistence(timeout: 5))
+          +        XCTAssertTrue(app.staticTexts["Geziyi başlatınca yakındaki yerler burada görünür."].exists)
+          +        photograph("Canli rehber - Kapali")
+          +        app.buttons["guide.toggle"].tap()
+          +        XCTAssertTrue(app.alerts["Konumla rehberi başlat"].waitForExistence(timeout: 3))
+          +        app.alerts.buttons["Vazgeç"].tap()
+          +        XCTAssertTrue(app.buttons["guide.toggle"].exists)
+          +        XCTAssertFalse(app.buttons["Geziyi durdur"].exists)
+          +    }
           +}
           --- a/project.yml
           +++ b/project.yml
@@ -4163,8 +4656,12 @@ jobs:
              OpenVisionTests:
                type: bundle.unit-test
                platform: iOS
-          @@ -166,6 +178,7 @@
+          @@ -164,8 +176,11 @@
+               test:
+                 config: Debug
                  gatherCoverageData: true
+          +      commandLineArguments:
+          +        "--ui-testing": true
                  targets:
                    - OpenVisionTests
           +        - OpenVisionUITests
@@ -4188,7 +4685,7 @@ jobs:
                // MARK: - Initialization
            
                init() {
-          +        if AppLaunchConfiguration.isUITesting { return }
+          +        if AppLaunchConfiguration.isTesting { return }
                    // Show timer/alarm notifications even when the app is in the foreground.
                    NotificationForegroundPresenter.shared.register()
                    // Create the location manager on the main thread + warm the cache for contextual notes.
@@ -4197,7 +4694,7 @@ jobs:
                    WindowGroup {
                        Group {
           -                if hasCompletedOnboarding {
-          +                if hasCompletedOnboarding || AppLaunchConfiguration.isUITesting {
+          +                if hasCompletedOnboarding || AppLaunchConfiguration.isTesting {
                                MainTabView()
                                    .environmentObject(settingsManager)
                                    .environmentObject(glassesManager)
@@ -4214,17 +4711,27 @@ jobs:
                            // Telemetry settings persist, but the sink lives in memory — without this a
                            // relaunch (or a jetsam kill during a model switch) silently stopped pushing.
           -                MetricsCollector.shared.restoreAtLaunch()
-          +                if !AppLaunchConfiguration.isUITesting { MetricsCollector.shared.restoreAtLaunch() }
+          +                if !AppLaunchConfiguration.isTesting { MetricsCollector.shared.restoreAtLaunch() }
                        }
                        .onOpenURL { url in
                            handleURL(url)
           --- a/OpenVision/Managers/GlassesManager.swift
           +++ b/OpenVision/Managers/GlassesManager.swift
-          @@ -74,6 +74,7 @@
+          @@ -44,7 +44,8 @@
+           
+               // MARK: - Private Properties
+           
+          -    private let wearables = Wearables.shared
+          +    // Access only after the app has configured the SDK. Test launches don't use hardware.
+          +    private var wearables: any WearablesInterface { Wearables.shared }
+               // 0.9.0 camera lifecycle: DeviceSession owns the device link, Camera owns the camera
+               // hardware, camera.stream carries frames. Stopping the camera cascades to the stream.
+               private var deviceSession: DeviceSession?
+          @@ -74,6 +75,7 @@
            
                private init() {
                    print("[GlassesManager] Initializing")
-          +        guard !AppLaunchConfiguration.isUITesting else { return }
+          +        guard !AppLaunchConfiguration.isTesting else { return }
                    setupRegistrationListener()
                    setupDevicesListener()
                }
@@ -4255,6 +4762,16 @@ jobs:
            
                /// Whether wake word detection is enabled (OpenClaw mode only)
                var wakeWordEnabled: Bool = true
+          @@ -170,6 +170,9 @@
+           
+               // MARK: - Advanced Settings
+           
+          +    /// Separate opt-in: never starts location tracking on launch or just by saving a setting.
+          +    var guideAutomaticNarration: Bool = false
+          +
+               /// Auto-reconnect on connection drop
+               var autoReconnect: Bool = true
+           
           --- /dev/null
           +++ b/OpenVision/Models/AssistantPresentation.swift
           @@ -0,0 +1,52 @@
@@ -4307,6 +4824,60 @@ jobs:
           +        case .listening, .live: return "waveform"
           +        case .thinking, .toolRunning: return "ellipsis.bubble"
           +        case .speaking: return "speaker.wave.2"
+          +        }
+          +    }
+          +}
+          --- /dev/null
+          +++ b/OpenVision/Models/GuidePolicy.swift
+          @@ -0,0 +1,51 @@
+          +import Foundation
+          +
+          +/// Pure rules shared by GPS updates and the UI; no network or microphone required.
+          +struct GuidePolicy {
+          +    private(set) var narratedIDs: Set<String> = []
+          +    private(set) var lastNarration = Date.distantPast
+          +    static func acceptsFix(age: TimeInterval, accuracy: Double, speed: Double) -> Bool {
+          +        age.isFinite && age >= -5 && age <= 90 && accuracy.isFinite && accuracy >= 0 && accuracy <= 100
+          +            && speed.isFinite && speed <= 3.5
+          +    }
+          +    func mayNarrate(id: String, distance: Double, now: Date, busy: Bool) -> Bool {
+          +        !busy && distance.isFinite && distance >= 0 && distance <= 300
+          +            && !narratedIDs.contains(id) && narratedIDs.count < 50
+          +            && now.timeIntervalSince(lastNarration) >= 90
+          +    }
+          +    mutating func didNarrate(id: String, now: Date) {
+          +        narratedIDs.insert(id)
+          +        lastNarration = now
+          +    }
+          +    mutating func reset() { self = GuidePolicy() }
+          +}
+          +
+          +struct GuidePlace: Identifiable, Equatable {
+          +    let id: String
+          +    let title: String
+          +    let summary: String
+          +    let latitude: Double
+          +    let longitude: Double
+          +    var sourceURL: URL { URL(string: "https://tr.wikipedia.org/?curid=\(id)")! }
+          +}
+          +
+          +enum GuideSourceParser {
+          +    static func places(from data: Data) throws -> [GuidePlace] {
+          +        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          +              root["error"] == nil else { throw CocoaError(.coderReadCorrupt) }
+          +        guard let query = root["query"] as? [String: Any] else { return [] }
+          +        guard let pages = query["pages"] as? [[String: Any]] else { throw CocoaError(.coderReadCorrupt) }
+          +        return pages.compactMap { page in
+          +            guard let id = page["pageid"] as? Int, id > 0,
+          +                  let title = page["title"] as? String, !title.isEmpty,
+          +                  let extract = page["extract"] as? String,
+          +                  let coordinates = page["coordinates"] as? [[String: Any]],
+          +                  let coordinate = coordinates.first,
+          +                  let lat = coordinate["lat"] as? Double, lat.isFinite, (-90...90).contains(lat),
+          +                  let lon = coordinate["lon"] as? Double, lon.isFinite, (-180...180).contains(lon) else { return nil }
+          +            let text = extract.trimmingCharacters(in: .whitespacesAndNewlines)
+          +            guard !text.isEmpty else { return nil }
+          +            return GuidePlace(id: String(id), title: title, summary: String(text.prefix(700)), latitude: lat, longitude: lon)
           +        }
           +    }
           +}
@@ -4363,6 +4934,38 @@ jobs:
           +    "version": 1
              }
            }
+          --- a/OpenVision/Resources/Info.plist
+          +++ b/OpenVision/Resources/Info.plist
+          @@ -78,6 +78,7 @@
+               <key>UIBackgroundModes</key>
+               <array>
+                   <string>audio</string>
+          +        <string>location</string>
+                   <string>fetch</string>
+                   <string>processing</string>
+                   <string>bluetooth-central</string>
+          @@ -121,7 +122,7 @@
+           
+               <!-- Location (if needed for context) -->
+               <key>NSLocationWhenInUseUsageDescription</key>
+          -    <string>OpenVision can use your location to provide location-aware responses.</string>
+          +    <string>Canlı rehber, başlattığın gezi boyunca iPhone konumunu yakındaki yerleri bulmak için kullanır. Geziyi durdurunca konum takibi biter.</string>
+           
+               <!-- Productivity tools -->
+               <key>NSCalendarsUsageDescription</key>
+          @@ -156,12 +157,8 @@
+               </dict>
+           
+               <!-- Appearance -->
+          -    <key>UIUserInterfaceStyle</key>
+          -    <string>Dark</string>
+           
+               <!-- Status Bar -->
+          -    <key>UIStatusBarStyle</key>
+          -    <string>UIStatusBarStyleLightContent</string>
+               <key>UIViewControllerBasedStatusBarAppearance</key>
+               <true/>
+           </dict>
           --- a/OpenVision/Services/Audio/AudioCaptureService.swift
           +++ b/OpenVision/Services/Audio/AudioCaptureService.swift
           @@ -20,6 +20,32 @@
@@ -4843,12 +5446,16 @@ jobs:
                    isModelSpeaking = false
                }
            
-          @@ -208,7 +215,11 @@
+          @@ -208,7 +215,15 @@
                private func buildSystemPrompt() -> String {
                    let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
                    var prompt = """
           -        You are a helpful AI assistant integrated with smart glasses. You can see what the user sees through their glasses camera.
           +        You are Jarvis, a helpful voice assistant integrated with smart glasses. Reply in Turkish by default.
+          +        When the user asks "burayı anlat", nearby sights, or city history, call city_guide.
+          +        It returns sourced location context only after the user starts a guide walk.
+          +        Never guess a location or which building they are looking at from GPS.
+          +        Speak only from the returned source and admit missing information.
           +        The camera is normally OFF. Never claim to see a current scene without a newly supplied image.
           +        When the user says "Ne görüyorsun?", "Buna bak" or "Bunu oku", the app will briefly capture
           +        and send an image with the question. Wait for that image before describing anything.
@@ -4856,7 +5463,7 @@ jobs:
            
                    Keep responses concise and conversational - the user is wearing glasses and expects quick, natural interactions.
            
-          @@ -247,7 +258,8 @@
+          @@ -247,7 +262,8 @@
            
                /// Send audio data to Gemini
                func sendAudio(data: Data) {
@@ -4866,7 +5473,7 @@ jobs:
            
                    let message: [String: Any] = [
                        "realtimeInput": [
-          @@ -291,6 +303,19 @@
+          @@ -291,6 +307,19 @@
                    try await sendJSON(message)
                }
            
@@ -4886,7 +5493,7 @@ jobs:
                /// Interrupt the AI (barge-in support)
                func interrupt() async {
                    // Send interrupt signal if model is speaking
-          @@ -320,8 +345,16 @@
+          @@ -320,8 +349,16 @@
                        ]
                    ]
            
@@ -4904,7 +5511,7 @@ jobs:
                    }
                }
            
-          @@ -411,23 +444,16 @@
+          @@ -411,23 +448,16 @@
            
                /// Handle server content
                private func handleServerContent(_ content: [String: Any]) {
@@ -4933,7 +5540,7 @@ jobs:
                       let parts = modelTurn["parts"] as? [[String: Any]] {
            
                        for part in parts {
-          @@ -459,6 +485,15 @@
+          @@ -459,6 +489,15 @@
                    if let inputTranscription = content["inputTranscription"] as? [String: Any],
                       let text = inputTranscription["text"] as? String {
                        onInputTranscription?(text)
@@ -4949,6 +5556,231 @@ jobs:
                    }
                }
            
+          --- /dev/null
+          +++ b/OpenVision/Services/NativeTools/CityGuideService.swift
+          @@ -0,0 +1,212 @@
+          +import Foundation
+          +import CoreLocation
+          +import AVFoundation
+          +
+          +/// A walk is explicitly started and never restored after launch. No route is stored.
+          +@MainActor
+          +final class CityGuideService: NSObject, ObservableObject, CLLocationManagerDelegate, AVSpeechSynthesizerDelegate {
+          +    static let shared = CityGuideService()
+          +    @Published private(set) var isActive = false
+          +    @Published private(set) var isSpeaking = false
+          +    @Published private(set) var places: [GuidePlace] = []
+          +    @Published private(set) var status = "Geziyi başlatınca yakındaki yerler burada görünür."
+          +    @Published private(set) var accuracy: Double?
+          +    var canNarrate: (() -> Bool)?
+          +    private lazy var location = CLLocationManager()
+          +    private let speech = AVSpeechSynthesizer()
+          +    private var policy = GuidePolicy()
+          +    private var fix: CLLocation?
+          +    private var lastSearchFix: CLLocation?
+          +    private var lastSearchAt = Date.distantPast
+          +    private var searchTask: Task<Void, Never>?
+          +    private var sessionID = UUID()
+          +    private override init() {
+          +        super.init()
+          +        speech.delegate = self
+          +    }
+          +
+          +    func start() {
+          +        guard !isActive, !AppLaunchConfiguration.isTesting else { return }
+          +        isActive = true
+          +        sessionID = UUID()
+          +        policy.reset()
+          +        places = []
+          +        lastSearchFix = nil
+          +        lastSearchAt = .distantPast
+          +        location.delegate = self
+          +        location.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+          +        location.distanceFilter = 30
+          +        location.activityType = .fitness
+          +        location.pausesLocationUpdatesAutomatically = true
+          +        updateAuthorization()
+          +    }
+          +
+          +    func stop() {
+          +        isActive = false
+          +        sessionID = UUID()
+          +        searchTask?.cancel()
+          +        searchTask = nil
+          +        location.stopUpdatingLocation()
+          +        location.allowsBackgroundLocationUpdates = false
+          +        stopSpeaking()
+          +        fix = nil
+          +        accuracy = nil
+          +        places = []
+          +        policy.reset()
+          +        status = "Gezi durduruldu. Konum takibi kapalı."
+          +    }
+          +
+          +    func stopSpeaking() {
+          +        speech.stopSpeaking(at: .immediate)
+          +        isSpeaking = false
+          +    }
+          +
+          +    private func updateAuthorization() {
+          +        guard isActive else { return }
+          +        switch location.authorizationStatus {
+          +        case .notDetermined:
+          +            status = "Rehber için iPhone’un konum iznini bekliyorum."
+          +            location.requestWhenInUseAuthorization()
+          +        case .authorizedAlways, .authorizedWhenInUse:
+          +            // Info.plist declares location. Enabled only for an explicitly active walk.
+          +            location.allowsBackgroundLocationUpdates = true
+          +            location.showsBackgroundLocationIndicator = true
+          +            location.startUpdatingLocation()
+          +            status = "Güncel konum bekleniyor."
+          +        case .denied, .restricted:
+          +            isActive = false
+          +            sessionID = UUID()
+          +            searchTask?.cancel()
+          +            searchTask = nil
+          +            status = "Konum izni kapalı. iPhone Ayarları → OpenVision → Konum’dan izin verebilirsin."
+          +            location.stopUpdatingLocation()
+          +            location.allowsBackgroundLocationUpdates = false
+          +            stopSpeaking()
+          +            places = []
+          +            fix = nil
+          +            accuracy = nil
+          +        @unknown default:
+          +            status = "Konum izni alınamadı."
+          +        }
+          +    }
+          +    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) { updateAuthorization() }
+          +    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+          +        guard isActive else { return }
+          +        status = "Konum alınamadı. Yakındaki yerleri tahmin etmiyorum."
+          +    }
+          +    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+          +        guard isActive, let latest = locations.last else { return }
+          +        accuracy = latest.horizontalAccuracy
+          +        guard GuidePolicy.acceptsFix(age: Date().timeIntervalSince(latest.timestamp), accuracy: latest.horizontalAccuracy, speed: latest.speed) else {
+          +            status = "Konum hassas değil veya yürüyüş hızı aşıldı. Otomatik anlatım bekliyor."
+          +            fix = nil
+          +            return
+          +        }
+          +        fix = latest
+          +        narrateNearbyIfPossible()
+          +        let moved = lastSearchFix.map { latest.distance(from: $0) >= 100 } ?? true
+          +        guard searchTask == nil, moved || Date().timeIntervalSince(lastSearchAt) >= 90 else { return }
+          +        refresh(around: latest)
+          +    }
+          +
+          +    private func refresh(around center: CLLocation) {
+          +        let token = sessionID
+          +        lastSearchAt = Date()
+          +        lastSearchFix = center
+          +        status = "Yakındaki Türkçe kaynaklar aranıyor…"
+          +        searchTask = Task { [weak self] in
+          +            do {
+          +                var url = URLComponents(string: "https://tr.wikipedia.org/w/api.php")!
+          +                let parameters = ["action":"query", "format":"json", "formatversion":"2",
+          +                    "generator":"geosearch", "ggscoord":"\(center.coordinate.latitude)|\(center.coordinate.longitude)",
+          +                    "ggsradius":"1000", "ggslimit":"10", "ggsnamespace":"0",
+          +                    "prop":"coordinates|extracts", "exintro":"1", "explaintext":"1", "exchars":"650", "exlimit":"10"]
+          +                url.queryItems = parameters.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+          +                var request = URLRequest(url: url.url!, timeoutInterval: 12)
+          +                request.setValue("OpenVisionCityGuide/3.0 (https://github.com/rayl15/OpenVision)", forHTTPHeaderField: "User-Agent")
+          +                let (data, response) = try await URLSession.shared.data(for: request)
+          +                try Task.checkCancellation()
+          +                guard let http = response as? HTTPURLResponse, http.statusCode == 200, data.count <= 1_000_000 else {
+          +                    throw URLError(.badServerResponse)
+          +                }
+          +                let results = try GuideSourceParser.places(from: data)
+          +                guard let self, self.isActive, self.sessionID == token else { return }
+          +                self.places = results.filter { self.distance(to: $0).map { $0 <= 1000 } ?? false }
+          +                    .sorted { (self.distance(to: $0) ?? .infinity) < (self.distance(to: $1) ?? .infinity) }
+          +                self.status = self.places.isEmpty ? "Yakında Türkçe kaynak bulunamadı. Yer veya tarih bilgisi uydurmuyorum." : "Kaynak: Türkçe Wikipedia. Konum hangi yöne baktığını göstermez."
+          +                self.searchTask = nil
+          +                self.narrateNearbyIfPossible()
+          +            } catch {
+          +                guard let self, self.isActive, self.sessionID == token, !Task.isCancelled else { return }
+          +                self.searchTask = nil
+          +                self.status = "Rehber kaynağına ulaşılamadı. İnternet bağlantısını kontrol et."
+          +            }
+          +        }
+          +    }
+          +
+          +    func distance(to place: GuidePlace) -> Double? {
+          +        guard let fix, GuidePolicy.acceptsFix(age: Date().timeIntervalSince(fix.timestamp), accuracy: fix.horizontalAccuracy, speed: fix.speed) else { return nil }
+          +        return fix.distance(from: CLLocation(latitude: place.latitude, longitude: place.longitude))
+          +    }
+          +
+          +    private func narrateNearbyIfPossible() {
+          +        guard SettingsManager.shared.settings.guideAutomaticNarration else { return }
+          +        guard let nearest = places.first(where: {
+          +            policy.mayNarrate(id: $0.id, distance: distance(to: $0) ?? .infinity, now: Date(), busy: isSpeaking || canNarrate?() != true)
+          +        }) else { return }
+          +        narrate(nearest)
+          +    }
+          +
+          +    func narrate(_ place: GuidePlace) {
+          +        guard isActive, let meters = distance(to: place), meters <= 1000 else {
+          +            status = "Anlatım için güncel ve hassas bir konum gerekiyor."
+          +            return
+          +        }
+          +        guard !isSpeaking, canNarrate?() == true else {
+          +            status = "Asistan konuşması bitince yeniden anlatmayı deneyebilirsin."
+          +            return
+          +        }
+          +        do {
+          +            // Do not reconfigure an existing Bluetooth/microphone route.
+          +            if AudioSessionManager.shared.currentMode == .inactive { try AudioSessionManager.shared.configure(for: .measurement) }
+          +        } catch { status = "Ses hazırlanamadı: \(error.localizedDescription)"; return }
+          +        let rounded = Int((meters / 10).rounded()) * 10
+          +        let utterance = AVSpeechUtterance(string: "Yaklaşık \(rounded) metre yakınında \(place.title) var. Wikipedia’ya göre: \(place.summary)")
+          +        utterance.voice = AVSpeechSynthesisVoice(language: "tr-TR")
+          +        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+          +        isSpeaking = true
+          +        policy.didNarrate(id: place.id, now: Date())
+          +        speech.speak(utterance)
+          +    }
+          +
+          +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +    }
+          +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +    }
+          +
+          +    func context() -> String {
+          +        guard isActive else { return "Canlı rehber kapalı. Rehber sekmesinden geziyi başlat. Kullanıcının konumunu tahmin etme." }
+          +        let nearby = places.compactMap { place -> String? in
+          +            guard let distance = distance(to: place), distance <= 1000 else { return nil }
+          +            return "\(place.title), yaklaşık \(Int(distance)) metre: \(place.summary) Kaynak: \(place.sourceURL.absoluteString)"
+          +        }
+          +        guard !nearby.isEmpty else { return status + " Kullanıcının baktığı binayı veya tarihini tahmin etme." }
+          +        return "Aşağıdakiler konuma yakın kaynak maddeleridir; kullanıcının baktığı yer kesin değildir. Güncel fiyat ve çalışma saati içermez. Türkçe, kısa cevap ver; yalnızca bu metindeki tarih bilgisine dayan.\n" + nearby.prefix(3).joined(separator: "\n")
+          +    }
+          +}
+          +
+          +struct CityGuideTool: NativeTool {
+          +    let name = "city_guide"
+          +    let description = "Get sourced Turkish information about places near the user's iPhone, only during an explicitly started city-guide walk. Use for 'burayı anlat', nearby sights, history, and city-guide questions. Never infer the user's view from GPS."
+          +    let parametersSchema: [String: Any] = ["type":"object", "properties":[
+          +        "action": ["type":"string", "enum":["context", "stop"], "description":"context: nearby sourced facts; stop: stop the walk and location tracking"]], "required":[]]
+          +    func execute(args: [String: Any]) async throws -> String {
+          +        if args["action"] as? String == "stop" {
+          +            await CityGuideService.shared.stop()
+          +            return "Gezi durduruldu. Konum takibi kapalı."
+          +        }
+          +        return await CityGuideService.shared.context()
+          +    }
+          +}
+          --- a/OpenVision/Services/NativeTools/NativeTool.swift
+          +++ b/OpenVision/Services/NativeTools/NativeTool.swift
+          @@ -56,6 +56,7 @@
+                       ReminderTool(),
+                       CalendarTool(),
+                       ContextualNoteTool(),
+          +            CityGuideTool(),
+                       ClipboardTool(),
+                       DocumentSearchTool(),
+                   ]
           --- a/OpenVision/Services/OpenAIRealtime/OpenAIRealtimeService.swift
           +++ b/OpenVision/Services/OpenAIRealtime/OpenAIRealtimeService.swift
           @@ -90,6 +90,7 @@
@@ -5353,10 +6185,19 @@ jobs:
                            break
           --- /dev/null
           +++ b/OpenVision/Testing/InterfaceTestSupport.swift
-          @@ -0,0 +1,40 @@
+          @@ -0,0 +1,49 @@
           +import SwiftUI
           +
           +enum AppLaunchConfiguration {
+          +    static var isTesting: Bool {
+          +        #if DEBUG
+          +        return isUITesting || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+          +            || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
+          +            || NSClassFromString("XCTestCase") != nil
+          +        #else
+          +        return false
+          +        #endif
+          +    }
           +    static var isUITesting: Bool {
           +        #if DEBUG
           +        return ProcessInfo.processInfo.arguments.contains("--ui-testing")
@@ -6076,6 +6917,65 @@ jobs:
           -    /// Frosted card fill.
           -    static let glass = Color.white.opacity(0.05)
            }
+          --- /dev/null
+          +++ b/OpenVision/Views/Guide/CityGuideView.swift
+          @@ -0,0 +1,56 @@
+          +import SwiftUI
+          +
+          +struct CityGuideView: View {
+          +    @ObservedObject private var guide = CityGuideService.shared
+          +    @EnvironmentObject var settingsManager: SettingsManager
+          +    @State private var showConsent = false
+          +    var body: some View {
+          +        NavigationStack {
+          +            List {
+          +                Section {
+          +                    Label("Şehri Jarvis ile keşfet", systemImage: "figure.walk")
+          +                        .font(.headline)
+          +                    Text(guide.status).foregroundStyle(.secondary)
+          +                        .accessibilityIdentifier("guide.status")
+          +                    if let accuracy = guide.accuracy, accuracy.isFinite, accuracy >= 0 {
+          +                        LabeledContent("Konum hassasiyeti", value: "Yaklaşık \(Int(accuracy)) m")
+          +                    }
+          +                    Button(guide.isActive ? "Geziyi durdur" : "Geziyi başlat", role: guide.isActive ? .destructive : nil) {
+          +                        if guide.isActive { guide.stop() } else { showConsent = true }
+          +                    }.accessibilityIdentifier("guide.toggle")
+          +                    if guide.isSpeaking { Button("Anlatımı durdur", role: .destructive) { guide.stopSpeaking() } }
+          +                }
+          +                Section {
+          +                    Toggle("Otomatik anlatım", isOn: $settingsManager.settings.guideAutomaticNarration)
+          +                } footer: {
+          +                    Text("300 metre yakındaki yeni bir nokta anlatılır. Aynı yer gezi boyunca tekrar anlatılmaz; anlatımlar arasında en az 90 saniye beklenir.")
+          +                }
+          +                Section("Yakındaki yerler") {
+          +                    if guide.places.isEmpty { Text("Güncel konum ve internet bağlantısı gerekiyor.").foregroundStyle(.secondary) }
+          +                    ForEach(guide.places) { place in
+          +                        VStack(alignment: .leading, spacing: 10) {
+          +                            Text(place.title).font(.headline)
+          +                            if let meters = guide.distance(to: place) { Text("Yaklaşık \(Int(meters)) metre").font(.subheadline).foregroundStyle(.secondary) }
+          +                            Text(place.summary).textSelection(.enabled)
+          +                            Button("Bu yeri anlat") { guide.narrate(place) }
+          +                            Link("Wikipedia’da oku", destination: place.sourceURL)
+          +                                .font(.footnote)
+          +                        }.padding(.vertical, 6)
+          +                    }
+          +                }
+          +                Section {
+          +                    Text("Konum iPhone’dan gelir. Kamera açılmaz. Konum hangi binaya baktığını kesin göstermez. Türkçe kaynak kapsamı şehre göre değişir; bu ilk sürüm bilet fiyatı, açık saatler veya rota tarifi vermez.")
+          +                } header: { Text("Rehber hakkında") } footer: {
+          +                    Text("Özetler Wikipedia’dan, CC BY-SA lisansı altında alınır. Kaynağı her yerin altında bulabilirsin. Gezi rotası uygulamada kaydedilmez.")
+          +                }
+          +            }
+          +            .navigationTitle("Canlı rehber")
+          +            .alert("Konumla rehberi başlat", isPresented: $showConsent) {
+          +                Button("Başlat") { guide.start() }
+          +                Button("Vazgeç", role: .cancel) {}
+          +            } message: {
+          +                Text("Gezi boyunca iPhone konumun yakındaki kaynakları bulmak için Wikipedia’ya gönderilir. Konum takibi ekran kilitlendiğinde de sürebilir ve pil tüketir. Geziyi durdurunca takip biter. Bu özellik ChatGPT API kredisi kullanmaz.")
+          +            }
+          +        }
+          +    }
+          +}
           --- a/OpenVision/Views/History/ConversationListView.swift
           +++ b/OpenVision/Views/History/ConversationListView.swift
           @@ -27,8 +27,13 @@
@@ -6158,7 +7058,7 @@ jobs:
                            Text(message.timestamp.formatted(date: .omitted, time: .shortened))
           --- a/OpenVision/Views/MainTabView.swift
           +++ b/OpenVision/Views/MainTabView.swift
-          @@ -1,94 +1,24 @@
+          @@ -1,94 +1,26 @@
           -// OpenVision - MainTabView.swift
           -// Main tab navigation: Voice Agent, History, Settings
           -
@@ -6195,6 +7095,8 @@ jobs:
           +                .tabItem { Label("Asistan", systemImage: "waveform") }.tag(0)
           +            ConversationListView()
           +                .tabItem { Label("Geçmiş", systemImage: "clock") }.tag(1)
+          +            CityGuideView()
+          +                .tabItem { Label("Rehber", systemImage: "map") }.tag(3)
           +            SettingsView()
           +                .tabItem { Label("Ayarlar", systemImage: "gearshape") }.tag(2)
                    }
@@ -6255,7 +7157,7 @@ jobs:
           -        }
           +    @ViewBuilder private var voiceContent: some View {
           +        #if DEBUG
-          +        if AppLaunchConfiguration.isUITesting { AssistantInterfaceTestView() }
+          +        if AppLaunchConfiguration.isTesting { AssistantInterfaceTestView() }
           +        else { VoiceAgentView() }
           +        #else
           +        VoiceAgentView()
@@ -7287,7 +8189,7 @@ jobs:
                @Published var agentState: AgentState = .idle
                @Published var userTranscript = ""
                @Published var aiTranscript = ""
-          @@ -50,6 +54,16 @@
+          @@ -50,6 +54,17 @@
                private var lastProcessedCommand = ""
                private var lastProcessedAt = Date.distantPast
                private var hasRequestedSpeechAuth = false
@@ -7301,10 +8203,11 @@ jobs:
           +    private var snapshotRequestedThisTurn = false
           +    private var liveMicrophoneWatchdog: Timer?
           +    private var lastLiveMicrophoneBufferAt = Date.distantPast
+          +    private var lastLiveConversationAt = Date.distantPast
            
                /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
                /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-          @@ -88,7 +102,7 @@
+          @@ -88,7 +103,7 @@
                        case .thinking: return "Thinking..."
                        case .speaking: return "Speaking..."
                        case .toolRunning: return "Running tool..."
@@ -7313,7 +8216,22 @@ jobs:
                        }
                    }
            
-          @@ -120,12 +134,22 @@
+          @@ -108,6 +123,14 @@
+               // MARK: - View lifecycle
+           
+               func onAppear() {
+          +        CityGuideService.shared.canNarrate = { [weak self] in
+          +            guard let self else { return false }
+          +            return !self.isChangingLiveMode && !self.isStoppingSession
+          +                && !self.commandTurnActive && self.agentState != .thinking && self.agentState != .connecting
+          +                && !self.ttsService.isSpeaking && !KokoroTTSService.shared.isSpeaking
+          +                && !self.audioPlayback.isPlaying
+          +                && (!self.isLiveVideoMode || Date().timeIntervalSince(self.lastLiveConversationAt) >= 12)
+          +        }
+                   setupVoiceCommandService()
+                   setupGlassesCallbacks()
+                   preloadLocalModelIfNeeded()
+          @@ -120,12 +143,22 @@
                }
            
                func onDisappear() {
@@ -7337,7 +8255,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +207,12 @@
+          @@ -183,6 +216,12 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -7350,7 +8268,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +284,7 @@
+          @@ -254,6 +293,7 @@
                }
            
                func startSession() {
@@ -7358,7 +8276,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +293,16 @@
+          @@ -262,6 +302,16 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -7375,7 +8293,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -276,7 +317,8 @@
+          @@ -276,7 +326,8 @@
                    configureAudioForGlasses()
            
                    // Connect to AI backend
@@ -7385,7 +8303,7 @@ jobs:
                        do {
                            switch settingsManager.settings.aiBackend {
                            case .openClaw:
-          @@ -309,6 +351,8 @@
+          @@ -309,6 +360,8 @@
                                )
                            }
            
@@ -7394,7 +8312,7 @@ jobs:
                            agentState = .listening
                            userTranscript = ""
                            aiTranscript = ""
-          @@ -321,10 +365,14 @@
+          @@ -321,10 +374,14 @@
                                // Put in listening mode (not waiting for wake word)
                                voiceCommandService.enterConversationMode()
                            } else {
@@ -7412,10 +8330,11 @@ jobs:
                            errorMessage = "Failed to connect: \(error.localizedDescription)"
                            isSessionActive = false
                            agentState = .idle
-          @@ -382,14 +430,32 @@
+          @@ -382,14 +439,33 @@
                }
            
                func stopSession() {
+          +        CityGuideService.shared.stopSpeaking()
           +        guard !isStoppingSession else { return }
           +        sessionStartTask?.cancel()
           +        commandTask?.cancel()
@@ -7447,7 +8366,7 @@ jobs:
                        switch settingsManager.settings.aiBackend {
                        case .openClaw:
                            await OpenClawService.shared.disconnect()
-          @@ -439,6 +505,7 @@
+          @@ -439,6 +515,7 @@
                /// quiet back to wake-word listening. The recognizer buffer is already reset by
                /// VoiceCommandService (so the stale transcript can't re-fire); here we just halt + end the turn.
                private func performFullStop() {
@@ -7455,15 +8374,16 @@ jobs:
                    // "Ok Vision stop" is an interruption too: the user cut the reply off. Close the turn
                    // deterministically before stopping the engines — delivered-then-stopped turns finish
                    // here (markSpokeDone is gated on firstAudio); a stop mid-thinking leaves the turn open
-          @@ -533,6 +600,7 @@
+          @@ -533,6 +610,8 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
           +            guard !self.isChangingLiveMode, !self.isStoppingSession else { return }
+          +            CityGuideService.shared.stopSpeaking()
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -585,6 +653,11 @@
+          @@ -585,6 +664,11 @@
                            return
                        }
            
@@ -7475,7 +8395,7 @@ jobs:
                        self.userTranscript = command
                        // Suspend ambient narration for the WHOLE turn (through reply playback).
                        self.commandTurnActive = true
-          @@ -614,7 +687,8 @@
+          @@ -614,7 +698,8 @@
                        self.historyAwaitingReply = true
            
                        // Send command to AI backend
@@ -7485,7 +8405,7 @@ jobs:
                            await self.sendCommand(command)
                        }
                    }
-          @@ -692,7 +766,7 @@
+          @@ -692,7 +777,7 @@
                            }
                        }
                        backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
@@ -7494,7 +8414,7 @@ jobs:
                            if isProcessing {
                                self.agentState = .thinking
                                // New reply: reset the sentence-streaming cursor for a clean start.
-          @@ -793,8 +867,15 @@
+          @@ -793,8 +878,15 @@
                    }
                }
            
@@ -7510,12 +8430,18 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -815,13 +896,14 @@
+          @@ -815,13 +907,20 @@
            
                /// Send command to AI backend
                private func sendCommand(_ command: String) async {
           +        guard !Task.isCancelled, isSessionActive, !isStoppingSession else { return }
                    let lowerCommand = command.lowercased()
+          +
+          +        if ["rehberi durdur", "rehberi kapat", "geziyi durdur"].contains(where: lowerCommand.contains) {
+          +            CityGuideService.shared.stop()
+          +            speakResponse("Gezi durduruldu. Konum takibi kapalı.")
+          +            return
+          +        }
            
                    // Check for "stop" command - stops TTS and waits for next command.
                    // Matched on WORDS, not substrings: `.contains("stop")` treated "what's on the desktop"
@@ -7526,7 +8452,7 @@ jobs:
                    let stopPhrases = ["be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it"]
                    let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                                         || stopPhrases.contains { lowerCommand.contains($0) })
-          @@ -962,7 +1044,8 @@
+          @@ -962,7 +1061,8 @@
                            agentState = isSessionActive ? .listening : .idle
                        }
                    } catch {
@@ -7536,7 +8462,7 @@ jobs:
                        agentState = isSessionActive ? .listening : .idle
                    }
                }
-          @@ -970,13 +1053,16 @@
+          @@ -970,13 +1070,16 @@
                // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
@@ -7554,7 +8480,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,15 +1078,26 @@
+          @@ -992,15 +1095,26 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -7583,7 +8509,7 @@ jobs:
            
                    // Stop TTS if speaking
                    ttsService.stop()
-          @@ -1011,27 +1108,46 @@
+          @@ -1011,27 +1125,46 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -7644,7 +8570,7 @@ jobs:
                        return
                    }
            
-          @@ -1039,42 +1155,67 @@
+          @@ -1039,42 +1172,68 @@
                    setupLiveVideoCallbacks(service)
            
                    // Setup audio capture → live backend
@@ -7652,6 +8578,7 @@ jobs:
           +        audioCapture.onAudioCaptured = { [weak self, weak service] data in
           +            guard let self, self.isLiveVideoMode else { return }
           +            self.lastLiveMicrophoneBufferAt = Date()
+          +            guard !CityGuideService.shared.isSpeaking else { return }
                        service?.sendAudio(data: data)
                    }
            
@@ -7728,7 +8655,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1627,213 @@
+          @@ -1486,89 +1645,217 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -7974,6 +8901,8 @@ jobs:
                    service.onAudioReceived = { [weak self] data in
           -            self?.audioPlayback.playAudio(data: data)
           +            guard let self, self.isLiveVideoMode, !self.isCapturingSnapshot else { return }
+          +            CityGuideService.shared.stopSpeaking()
+          +            self.lastLiveConversationAt = Date()
           +            self.audioPlayback.playAudio(data: data)
                    }
            
@@ -7995,6 +8924,8 @@ jobs:
           -                if isStopCommand && self.isLiveVideoMode {
           -                    print("[VoiceAgent] Stop command detected in transcription: \(text)")
           +                guard self.isLiveVideoMode else { return }
+          +                CityGuideService.shared.stopSpeaking()
+          +                self.lastLiveConversationAt = Date()
           +                let shouldStop = self.liveStopCommand.consume(text)
           +                self.userTranscript = self.liveStopCommand.transcript
           +                if shouldStop {
@@ -8005,7 +8936,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1854,10 @@
+          @@ -1589,6 +1876,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -8016,7 +8947,7 @@ jobs:
                        }
                    }
            
-          @@ -1598,6 +1867,7 @@
+          @@ -1598,6 +1889,7 @@
                            guard let self else { return }
                            if self.isLiveVideoMode {
                                print("[VoiceAgent] Live backend disconnected unexpectedly")
@@ -8024,7 +8955,7 @@ jobs:
                                await self.stopLiveVideoMode()
                            }
                        }
-          @@ -1969,8 +2239,15 @@
+          @@ -1969,8 +2261,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -8042,7 +8973,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2538,21 @@
+          @@ -2261,3 +2560,21 @@
                    return result
                }
            }
@@ -8126,8 +9057,55 @@ jobs:
           +    }
           +}
           --- /dev/null
+          +++ b/OpenVisionTests/GuideSafetyTests.swift
+          @@ -0,0 +1,44 @@
+          +import XCTest
+          +@testable import OpenVision
+          +
+          +final class GuideSafetyTests: XCTestCase {
+          +    func testBadOrOldGPSNeverEnablesNarration() {
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 91, accuracy: 20, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: -6, accuracy: 20, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: -1, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: .nan, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: 120, speed: 1))
+          +        XCTAssertFalse(GuidePolicy.acceptsFix(age: 1, accuracy: 10, speed: 10))
+          +        XCTAssertTrue(GuidePolicy.acceptsFix(age: 1, accuracy: 10, speed: -1))
+          +    }
+          +    func testNarrationWaitsForSilenceDistanceAndCooldown() {
+          +        var policy = GuidePolicy()
+          +        let now = Date()
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: 20, now: now, busy: true))
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: .infinity, now: now, busy: false))
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: 301, now: now, busy: false))
+          +        XCTAssertTrue(policy.mayNarrate(id: "a", distance: 20, now: now, busy: false))
+          +        policy.didNarrate(id: "a", now: now)
+          +        XCTAssertFalse(policy.mayNarrate(id: "a", distance: 20, now: now.addingTimeInterval(100), busy: false))
+          +        XCTAssertFalse(policy.mayNarrate(id: "b", distance: 20, now: now.addingTimeInterval(89), busy: false))
+          +        XCTAssertTrue(policy.mayNarrate(id: "b", distance: 20, now: now.addingTimeInterval(90), busy: false))
+          +        policy.reset()
+          +        XCTAssertTrue(policy.mayNarrate(id: "a", distance: 20, now: now, busy: false))
+          +    }
+          +    func testSourceParserRejectsMissingCoordinatesEmptyAndInvalidData() throws {
+          +        let data = Data(#"{"query":{"pages":[{"pageid":1,"title":"Kule","extract":"Kaynak metni.","coordinates":[{"lat":41.0,"lon":29.0}]},{"pageid":2,"title":"Koordinatsız","extract":"Tahmin etme"},{"pageid":3,"title":"Hatalı","extract":"Metin","coordinates":[{"lat":200.0,"lon":29.0}]}]}}"#.utf8)
+          +        let places = try GuideSourceParser.places(from: data)
+          +        XCTAssertEqual(places.count, 1)
+          +        XCTAssertEqual(places[0].title, "Kule")
+          +        XCTAssertEqual(places[0].sourceURL.host, "tr.wikipedia.org")
+          +        XCTAssertEqual(try GuideSourceParser.places(from: Data("{}".utf8)), [])
+          +        XCTAssertThrowsError(try GuideSourceParser.places(from: Data(#"{"error":{"code":"badvalue"}}"#.utf8)))
+          +        XCTAssertThrowsError(try GuideSourceParser.places(from: Data("not json".utf8)))
+          +    }
+          +    @MainActor func testInactiveGuideNeverReturnsCachedLocation() async throws {
+          +        CityGuideService.shared.stop()
+          +        let result = try await CityGuideTool().execute(args: [:])
+          +        XCTAssertTrue(result.contains("kapalı"))
+          +        XCTAssertTrue(CityGuideService.shared.places.isEmpty)
+          +    }
+          +}
+          --- /dev/null
           +++ b/OpenVisionUITests/NativeInterfaceTests.swift
-          @@ -0,0 +1,96 @@
+          @@ -0,0 +1,108 @@
           +import XCTest
           +
           +final class NativeInterfaceTests: XCTestCase {
@@ -8223,6 +9201,18 @@ jobs:
           +        app.tabBars.buttons["Asistan"].tap()
           +        XCTAssertTrue(app.buttons["assistant.primary"].isHittable)
           +    }
+          +    func testGuideStartsOnlyAfterExplicitConsent() {
+          +        launch()
+          +        app.tabBars.buttons["Rehber"].tap()
+          +        XCTAssertTrue(app.buttons["guide.toggle"].waitForExistence(timeout: 5))
+          +        XCTAssertTrue(app.staticTexts["Geziyi başlatınca yakındaki yerler burada görünür."].exists)
+          +        photograph("Canli rehber - Kapali")
+          +        app.buttons["guide.toggle"].tap()
+          +        XCTAssertTrue(app.alerts["Konumla rehberi başlat"].waitForExistence(timeout: 3))
+          +        app.alerts.buttons["Vazgeç"].tap()
+          +        XCTAssertTrue(app.buttons["guide.toggle"].exists)
+          +        XCTAssertFalse(app.buttons["Geziyi durdur"].exists)
+          +    }
           +}
           --- a/project.yml
           +++ b/project.yml
@@ -8245,8 +9235,12 @@ jobs:
              OpenVisionTests:
                type: bundle.unit-test
                platform: iOS
-          @@ -166,6 +178,7 @@
+          @@ -164,8 +176,11 @@
+               test:
+                 config: Debug
                  gatherCoverageData: true
+          +      commandLineArguments:
+          +        "--ui-testing": true
                  targets:
                    - OpenVisionTests
           +        - OpenVisionUITests
@@ -8260,11 +9254,14 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Managers/SettingsManager.swift
           xcrun swiftc -frontend -parse OpenVision/Models/AppSettings.swift
           xcrun swiftc -frontend -parse OpenVision/Models/AssistantPresentation.swift
+          xcrun swiftc -frontend -parse OpenVision/Models/GuidePolicy.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/AudioCaptureService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/AudioPlaybackService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/MicrophoneInputRouter.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/PCMCodec.swift
           xcrun swiftc -frontend -parse OpenVision/Services/GeminiLive/GeminiLiveService.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/NativeTools/CityGuideService.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/NativeTools/NativeTool.swift
           xcrun swiftc -frontend -parse OpenVision/Services/OpenAIRealtime/OpenAIRealtimeService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Voice/LiveStopCommand.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Voice/VoiceCommandService.swift
@@ -8272,6 +9269,7 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Views/Components/AssistantScreen.swift
           xcrun swiftc -frontend -parse OpenVision/Views/Components/OnboardingView.swift
           xcrun swiftc -frontend -parse OpenVision/Views/Components/Theme.swift
+          xcrun swiftc -frontend -parse OpenVision/Views/Guide/CityGuideView.swift
           xcrun swiftc -frontend -parse OpenVision/Views/History/ConversationListView.swift
           xcrun swiftc -frontend -parse OpenVision/Views/MainTabView.swift
           xcrun swiftc -frontend -parse OpenVision/Views/Settings/AIBackendSettingsView.swift
@@ -8281,6 +9279,7 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentView.swift
           xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           xcrun swiftc -frontend -parse OpenVisionTests/AssistantSafetyTests.swift
+          xcrun swiftc -frontend -parse OpenVisionTests/GuideSafetyTests.swift
           xcrun swiftc -frontend -parse OpenVisionUITests/NativeInterfaceTests.swift
           cat > build/live_control_tests.swift <<'LIVE_CONTROL_TESTS'
           import Foundation
