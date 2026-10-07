@@ -32,60 +32,6 @@ jobs:
           xcodebuild -downloadComponent MetalToolchain
           mkdir -p build
 
-      - name: Kisisel deneme ayarlari
-        shell: bash
-        env:
-          REPOSITORY_ID: ${{ github.repository_id }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os
-          import pathlib
-          import plistlib
-          import shutil
-
-          root = pathlib.Path.cwd()
-          identifier = 'app.personal.openvision.r' + os.environ['REPOSITORY_ID']
-          root.joinpath('Config.xcconfig').write_text(
-              'DEVELOPMENT_TEAM =\n'
-              f'PRODUCT_BUNDLE_IDENTIFIER = {identifier}\n'
-              'META_APP_ID = 0\n'
-              'CLIENT_TOKEN =\n'
-              'APP_LINK_URL_SCHEME = openvision\n', encoding='utf-8')
-          shutil.copyfile(root / 'OpenVision/Config/Config.swift.example',
-                          root / 'OpenVision/Config/Config.swift')
-
-          # Personal signing may not support increased-memory-limit. This build
-          # targets the cloud OpenAI backend; avoid memory-heavy local models.
-          entitlement = root / 'OpenVision/OpenVision.entitlements'
-          entitlement.write_bytes(plistlib.dumps({}))
-          settings = root / 'OpenVision/Models/AppSettings.swift'
-          source = settings.read_text(encoding='utf-8')
-          original = 'var aiBackend: AIBackendType = .openClaw'
-          if source.count(original) != 1:
-              raise SystemExit('Unexpected upstream settings; review before building.')
-          settings.write_text(source.replace(original,
-                              'var aiBackend: AIBackendType = .openAI'), encoding='utf-8')
-
-          # MLX's optional FoundationModels adapter targets a different Apple
-          # API revision. OpenVision uses its own Apple service and does not
-          # need this adapter. Explicit empty traits disable package defaults.
-          project = root / 'project.yml'
-          specification = project.read_text(encoding='utf-8')
-          pin = '    revision: "68947ccdca79bcf7a26dc220f73caa060369513c"'
-          if specification.count(pin) != 1:
-              raise SystemExit('Unexpected MLX package pin; review before building.')
-          project.write_text(specification.replace(pin, pin + '\n    traits: []'), encoding='utf-8')
-
-          # Use the glasses for the actual test. No API keys, Apple passwords,
-          # developer certificates or user data are embedded in this build.
-          info = root / 'OpenVision/Resources/Info.plist'
-          data = plistlib.loads(info.read_bytes())
-          data['UIRequiredDeviceCapabilities'] = ['arm64', 'microphone']
-          info.write_bytes(plistlib.dumps(data))
-          PY
-          xcodegen generate
-
       - name: Native tasarim ve guvenlik kontrolleri
         shell: bash
         run: |
@@ -979,7 +925,7 @@ jobs:
            
           --- /dev/null
           +++ b/OpenVision/Services/NativeTools/CityGuideService.swift
-          @@ -0,0 +1,212 @@
+          @@ -0,0 +1,218 @@
           +import Foundation
           +import CoreLocation
           +import AVFoundation
@@ -1162,10 +1108,16 @@ jobs:
           +    }
           +
           +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +        Task { @MainActor [weak self] in
+          +            guard let self else { return }
+          +            self.isSpeaking = self.speech.isSpeaking
+          +        }
           +    }
           +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +        Task { @MainActor [weak self] in
+          +            guard let self else { return }
+          +            self.isSpeaking = self.speech.isSpeaking
+          +        }
           +    }
           +
           +    func context() -> String {
@@ -5558,7 +5510,7 @@ jobs:
            
           --- /dev/null
           +++ b/OpenVision/Services/NativeTools/CityGuideService.swift
-          @@ -0,0 +1,212 @@
+          @@ -0,0 +1,218 @@
           +import Foundation
           +import CoreLocation
           +import AVFoundation
@@ -5741,10 +5693,16 @@ jobs:
           +    }
           +
           +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +        Task { @MainActor [weak self] in
+          +            guard let self else { return }
+          +            self.isSpeaking = self.speech.isSpeaking
+          +        }
           +    }
           +    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-          +        Task { @MainActor [weak self] in self?.isSpeaking = false }
+          +        Task { @MainActor [weak self] in
+          +            guard let self else { return }
+          +            self.isSpeaking = self.speech.isSpeaking
+          +        }
           +    }
           +
           +    func context() -> String {
@@ -9248,7 +9206,6 @@ jobs:
                  config: Release
                analyze:
           NATIVE_PATCH
-          xcodegen generate
           xcrun swiftc -frontend -parse OpenVision/App/OpenVisionApp.swift
           xcrun swiftc -frontend -parse OpenVision/Managers/GlassesManager.swift
           xcrun swiftc -frontend -parse OpenVision/Managers/SettingsManager.swift
@@ -9398,6 +9355,60 @@ jobs:
           MICROPHONE_ROUTER_TESTS
           xcrun swiftc -parse-as-library OpenVision/Services/Audio/MicrophoneInputRouter.swift build/microphone_router_tests.swift -o build/MICROPHONE_ROUTER_TESTS
           ./build/MICROPHONE_ROUTER_TESTS
+
+      - name: Kisisel deneme ayarlari
+        shell: bash
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import plistlib
+          import shutil
+
+          root = pathlib.Path.cwd()
+          identifier = 'app.personal.openvision.r' + os.environ['REPOSITORY_ID']
+          root.joinpath('Config.xcconfig').write_text(
+              'DEVELOPMENT_TEAM =\n'
+              f'PRODUCT_BUNDLE_IDENTIFIER = {identifier}\n'
+              'META_APP_ID = 0\n'
+              'CLIENT_TOKEN =\n'
+              'APP_LINK_URL_SCHEME = openvision\n', encoding='utf-8')
+          shutil.copyfile(root / 'OpenVision/Config/Config.swift.example',
+                          root / 'OpenVision/Config/Config.swift')
+
+          # Personal signing may not support increased-memory-limit. This build
+          # targets the cloud OpenAI backend; avoid memory-heavy local models.
+          entitlement = root / 'OpenVision/OpenVision.entitlements'
+          entitlement.write_bytes(plistlib.dumps({}))
+          settings = root / 'OpenVision/Models/AppSettings.swift'
+          source = settings.read_text(encoding='utf-8')
+          original = 'var aiBackend: AIBackendType = .openClaw'
+          if source.count(original) != 1:
+              raise SystemExit('Unexpected upstream settings; review before building.')
+          settings.write_text(source.replace(original,
+                              'var aiBackend: AIBackendType = .openAI'), encoding='utf-8')
+
+          # MLX's optional FoundationModels adapter targets a different Apple
+          # API revision. OpenVision uses its own Apple service and does not
+          # need this adapter. Explicit empty traits disable package defaults.
+          project = root / 'project.yml'
+          specification = project.read_text(encoding='utf-8')
+          pin = '    revision: "68947ccdca79bcf7a26dc220f73caa060369513c"'
+          if specification.count(pin) != 1:
+              raise SystemExit('Unexpected MLX package pin; review before building.')
+          project.write_text(specification.replace(pin, pin + '\n    traits: []'), encoding='utf-8')
+
+          # Use the glasses for the actual test. No API keys, Apple passwords,
+          # developer certificates or user data are embedded in this build.
+          info = root / 'OpenVision/Resources/Info.plist'
+          data = plistlib.loads(info.read_bytes())
+          data['UIRequiredDeviceCapabilities'] = ['arm64', 'microphone']
+          info.write_bytes(plistlib.dumps(data))
+          PY
+          xcodegen generate
 
       - name: iPhone uygulamasini imzasiz derle
         shell: bash
