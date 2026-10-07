@@ -563,7 +563,15 @@ jobs:
            // MARK: - Errors
           --- a/OpenVision/Services/Audio/AudioPlaybackService.swift
           +++ b/OpenVision/Services/Audio/AudioPlaybackService.swift
-          @@ -33,6 +33,7 @@
+          @@ -19,6 +19,7 @@
+           
+               private var audioEngine: AVAudioEngine?
+               private var playerNode: AVAudioPlayerNode?
+          +    private var queueState = PlaybackQueueState()
+           
+               // MARK: - Format
+           
+          @@ -33,6 +34,7 @@
            
                /// Setup audio engine for playback
                func setup() throws {
@@ -571,7 +579,7 @@ jobs:
                    audioEngine = AVAudioEngine()
                    playerNode = AVAudioPlayerNode()
            
-          @@ -45,6 +46,10 @@
+          @@ -45,6 +47,10 @@
                    // Create output format (Float32 at device sample rate)
                    let outputFormat = engine.outputNode.outputFormat(forBus: 0)
            
@@ -582,7 +590,7 @@ jobs:
                    engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
            
                    // Forward what we play to the session recorder (cheap no-op when not recording): the
-          @@ -55,7 +60,8 @@
+          @@ -55,13 +61,14 @@
                        SessionRecorder.shared.appendPlaybackAudio(buffer, at: when)
                    }
            
@@ -592,7 +600,14 @@ jobs:
                    print("[AudioPlayback] Engine started")
                }
            
-          @@ -78,7 +84,9 @@
+               /// Teardown audio engine
+               func teardown() {
+          -        playerNode?.stop()
+          +        stop()
+                   audioEngine?.stop()
+                   audioEngine = nil
+                   playerNode = nil
+          @@ -78,7 +85,9 @@
                    }
            
                    // Convert Int16 PCM to Float32
@@ -603,7 +618,7 @@ jobs:
            
                    // Create buffer
                    let outputFormat = engine.outputNode.outputFormat(forBus: 0)
-          @@ -87,7 +95,7 @@
+          @@ -87,23 +96,25 @@
                    // Resample if needed
                    let resampledSamples: [Float]
                    if inputSampleRate != outputSampleRate {
@@ -612,7 +627,37 @@ jobs:
                    } else {
                        resampledSamples = floatSamples
                    }
-          @@ -123,45 +131,9 @@
+           
+          +        guard !resampledSamples.isEmpty else { return }
+                   guard let buffer = createBuffer(from: resampledSamples, format: outputFormat) else {
+                       print("[AudioPlayback] Failed to create buffer")
+                       return
+                   }
+           
+                   // Schedule and play
+          -        player.scheduleBuffer(buffer) { [weak self] in
+          +        let token = queueState.enqueue()
+          +        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                       Task { @MainActor in
+          -                // Check if more audio is queued
+          -                if self?.playerNode?.isPlaying == false {
+          -                    self?.isPlaying = false
+          -                    self?.onPlaybackComplete?()
+          +                guard let self else { return }
+          +                if self.queueState.complete(token) {
+          +                    self.isPlaying = false
+          +                    self.onPlaybackComplete?()
+                           }
+                       }
+                   }
+          @@ -117,51 +128,16 @@
+           
+               /// Stop playback
+               func stop() {
+          +        queueState.reset()
+                   playerNode?.stop()
+                   isPlaying = false
+               }
            
                // MARK: - Conversion
            
@@ -741,6 +786,30 @@ jobs:
           +            let next = min(index + 1, samples.count - 1)
           +            return samples[index] * (1 - fraction) + samples[next] * fraction
           +        }
+          +    }
+          +}
+          --- /dev/null
+          +++ b/OpenVision/Services/Audio/PlaybackQueueState.swift
+          @@ -0,0 +1,21 @@
+          +import Foundation
+          +
+          +/// Player-node `isPlaying` remains true after the last buffer. Track buffers, not the node.
+          +struct PlaybackQueueState {
+          +    private(set) var pendingCount = 0
+          +    private var generation = UUID()
+          +    mutating func enqueue() -> UUID {
+          +        pendingCount += 1
+          +        return generation
+          +    }
+          +    /// True only when the final current-generation buffer has actually played back.
+          +    mutating func complete(_ token: UUID) -> Bool {
+          +        guard token == generation, pendingCount > 0 else { return false }
+          +        pendingCount -= 1
+          +        return pendingCount == 0
+          +    }
+          +    mutating func reset() {
+          +        generation = UUID()
+          +        pendingCount = 0
           +    }
           +}
           --- a/OpenVision/Services/GeminiLive/GeminiLiveService.swift
@@ -3628,7 +3697,7 @@ jobs:
                        }
                    }
            
-          @@ -108,6 +123,23 @@
+          @@ -108,6 +123,25 @@
                // MARK: - View lifecycle
            
                func onAppear() {
@@ -3636,9 +3705,11 @@ jobs:
           +            guard let self else { return false }
           +            return !self.isChangingLiveMode && !self.isStoppingSession
           +                && !self.commandTurnActive && self.agentState != .thinking && self.agentState != .connecting
+          +                && self.agentState != .toolRunning && self.agentState != .speaking
           +                && !self.ttsService.isSpeaking && !KokoroTTSService.shared.isSpeaking
           +                && !self.audioPlayback.isPlaying
           +                && (!self.isLiveVideoMode || self.activeLiveService === self.geminiLive)
+          +                && (!self.isLiveVideoMode || (!self.geminiLive.isProcessing && !self.geminiLive.isModelSpeaking))
           +                && (!self.isLiveVideoMode || Date().timeIntervalSince(self.lastLiveConversationAt) >= 12)
           +        }
           +        CityGuideService.shared.narrateWithAssistant = { [weak self] source in
@@ -3652,7 +3723,7 @@ jobs:
                    setupVoiceCommandService()
                    setupGlassesCallbacks()
                    preloadLocalModelIfNeeded()
-          @@ -120,12 +152,22 @@
+          @@ -120,12 +154,22 @@
                }
            
                func onDisappear() {
@@ -3676,7 +3747,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +225,12 @@
+          @@ -183,6 +227,12 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -3689,7 +3760,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +302,7 @@
+          @@ -254,6 +304,7 @@
                }
            
                func startSession() {
@@ -3697,7 +3768,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +311,16 @@
+          @@ -262,6 +313,16 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -3714,7 +3785,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -276,7 +335,8 @@
+          @@ -276,7 +337,8 @@
                    configureAudioForGlasses()
            
                    // Connect to AI backend
@@ -3724,7 +3795,7 @@ jobs:
                        do {
                            switch settingsManager.settings.aiBackend {
                            case .openClaw:
-          @@ -309,6 +369,8 @@
+          @@ -309,6 +371,8 @@
                                )
                            }
            
@@ -3733,7 +3804,7 @@ jobs:
                            agentState = .listening
                            userTranscript = ""
                            aiTranscript = ""
-          @@ -321,10 +383,14 @@
+          @@ -321,10 +385,14 @@
                                // Put in listening mode (not waiting for wake word)
                                voiceCommandService.enterConversationMode()
                            } else {
@@ -3751,7 +3822,7 @@ jobs:
                            errorMessage = "Failed to connect: \(error.localizedDescription)"
                            isSessionActive = false
                            agentState = .idle
-          @@ -382,14 +448,33 @@
+          @@ -382,14 +450,33 @@
                }
            
                func stopSession() {
@@ -3787,7 +3858,7 @@ jobs:
                        switch settingsManager.settings.aiBackend {
                        case .openClaw:
                            await OpenClawService.shared.disconnect()
-          @@ -439,6 +524,7 @@
+          @@ -439,6 +526,7 @@
                /// quiet back to wake-word listening. The recognizer buffer is already reset by
                /// VoiceCommandService (so the stale transcript can't re-fire); here we just halt + end the turn.
                private func performFullStop() {
@@ -3795,7 +3866,7 @@ jobs:
                    // "Ok Vision stop" is an interruption too: the user cut the reply off. Close the turn
                    // deterministically before stopping the engines — delivered-then-stopped turns finish
                    // here (markSpokeDone is gated on firstAudio); a stop mid-thinking leaves the turn open
-          @@ -533,6 +619,8 @@
+          @@ -533,6 +621,8 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -3804,7 +3875,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -585,6 +673,11 @@
+          @@ -585,6 +675,11 @@
                            return
                        }
            
@@ -3816,7 +3887,7 @@ jobs:
                        self.userTranscript = command
                        // Suspend ambient narration for the WHOLE turn (through reply playback).
                        self.commandTurnActive = true
-          @@ -614,7 +707,8 @@
+          @@ -614,7 +709,8 @@
                        self.historyAwaitingReply = true
            
                        // Send command to AI backend
@@ -3826,7 +3897,7 @@ jobs:
                            await self.sendCommand(command)
                        }
                    }
-          @@ -692,7 +786,7 @@
+          @@ -692,7 +788,7 @@
                            }
                        }
                        backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
@@ -3835,7 +3906,7 @@ jobs:
                            if isProcessing {
                                self.agentState = .thinking
                                // New reply: reset the sentence-streaming cursor for a clean start.
-          @@ -793,8 +887,15 @@
+          @@ -793,8 +889,15 @@
                    }
                }
            
@@ -3851,7 +3922,7 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -815,13 +916,20 @@
+          @@ -815,13 +918,20 @@
            
                /// Send command to AI backend
                private func sendCommand(_ command: String) async {
@@ -3873,7 +3944,7 @@ jobs:
                    let stopPhrases = ["be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it"]
                    let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                                         || stopPhrases.contains { lowerCommand.contains($0) })
-          @@ -962,7 +1070,8 @@
+          @@ -962,7 +1072,8 @@
                            agentState = isSessionActive ? .listening : .idle
                        }
                    } catch {
@@ -3883,7 +3954,7 @@ jobs:
                        agentState = isSessionActive ? .listening : .idle
                    }
                }
-          @@ -970,13 +1079,16 @@
+          @@ -970,13 +1081,16 @@
                // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
@@ -3901,7 +3972,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,15 +1104,26 @@
+          @@ -992,15 +1106,26 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -3930,7 +4001,7 @@ jobs:
            
                    // Stop TTS if speaking
                    ttsService.stop()
-          @@ -1011,27 +1134,46 @@
+          @@ -1011,27 +1136,46 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -3991,7 +4062,7 @@ jobs:
                        return
                    }
            
-          @@ -1039,42 +1181,68 @@
+          @@ -1039,42 +1183,69 @@
                    setupLiveVideoCallbacks(service)
            
                    // Setup audio capture → live backend
@@ -4057,6 +4128,7 @@ jobs:
           +        isSessionActive = true
                    agentState = .liveVideo
           +        lastLiveMicrophoneBufferAt = Date()
+          +        lastLiveConversationAt = Date()
           +        liveMicrophoneWatchdog?.invalidate()
           +        liveMicrophoneWatchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
           +            Task { @MainActor in
@@ -4076,7 +4148,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1654,217 @@
+          @@ -1486,89 +1657,217 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -4357,7 +4429,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1885,10 @@
+          @@ -1589,6 +1888,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -4368,7 +4440,7 @@ jobs:
                        }
                    }
            
-          @@ -1598,6 +1898,7 @@
+          @@ -1598,6 +1901,7 @@
                            guard let self else { return }
                            if self.isLiveVideoMode {
                                print("[VoiceAgent] Live backend disconnected unexpectedly")
@@ -4376,7 +4448,7 @@ jobs:
                                await self.stopLiveVideoMode()
                            }
                        }
-          @@ -1969,8 +2270,15 @@
+          @@ -1969,8 +2273,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -4394,7 +4466,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2569,21 @@
+          @@ -2261,3 +2572,21 @@
                    return result
                }
            }
@@ -4522,6 +4594,43 @@ jobs:
           +        let result = try await CityGuideTool().execute(args: [:])
           +        XCTAssertTrue(result.contains("kapalı"))
           +        XCTAssertTrue(CityGuideService.shared.places.isEmpty)
+          +    }
+          +}
+          --- /dev/null
+          +++ b/OpenVisionTests/PlaybackQueueTests.swift
+          @@ -0,0 +1,34 @@
+          +import XCTest
+          +@testable import OpenVision
+          +
+          +final class PlaybackQueueTests: XCTestCase {
+          +    func testFinalBufferEndsPlaybackExactlyOnce() {
+          +        var queue = PlaybackQueueState()
+          +        let first = queue.enqueue()
+          +        let second = queue.enqueue()
+          +        XCTAssertEqual(queue.pendingCount, 2)
+          +        XCTAssertFalse(queue.complete(first))
+          +        XCTAssertEqual(queue.pendingCount, 1)
+          +        XCTAssertTrue(queue.complete(second))
+          +        XCTAssertEqual(queue.pendingCount, 0)
+          +        XCTAssertFalse(queue.complete(second))
+          +    }
+          +    func testOldCompletionAfterStopCannotEndNewReply() {
+          +        var queue = PlaybackQueueState()
+          +        let old = queue.enqueue()
+          +        queue.reset()
+          +        let current = queue.enqueue()
+          +        XCTAssertFalse(queue.complete(old))
+          +        XCTAssertEqual(queue.pendingCount, 1)
+          +        XCTAssertTrue(queue.complete(current))
+          +    }
+          +    func testStopClearsEveryQueuedBuffer() {
+          +        var queue = PlaybackQueueState()
+          +        let token = queue.enqueue()
+          +        _ = queue.enqueue()
+          +        _ = queue.enqueue()
+          +        queue.reset()
+          +        XCTAssertEqual(queue.pendingCount, 0)
+          +        XCTAssertFalse(queue.complete(token))
           +    }
           +}
           --- /dev/null
@@ -5196,7 +5305,15 @@ jobs:
            // MARK: - Errors
           --- a/OpenVision/Services/Audio/AudioPlaybackService.swift
           +++ b/OpenVision/Services/Audio/AudioPlaybackService.swift
-          @@ -33,6 +33,7 @@
+          @@ -19,6 +19,7 @@
+           
+               private var audioEngine: AVAudioEngine?
+               private var playerNode: AVAudioPlayerNode?
+          +    private var queueState = PlaybackQueueState()
+           
+               // MARK: - Format
+           
+          @@ -33,6 +34,7 @@
            
                /// Setup audio engine for playback
                func setup() throws {
@@ -5204,7 +5321,7 @@ jobs:
                    audioEngine = AVAudioEngine()
                    playerNode = AVAudioPlayerNode()
            
-          @@ -45,6 +46,10 @@
+          @@ -45,6 +47,10 @@
                    // Create output format (Float32 at device sample rate)
                    let outputFormat = engine.outputNode.outputFormat(forBus: 0)
            
@@ -5215,7 +5332,7 @@ jobs:
                    engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
            
                    // Forward what we play to the session recorder (cheap no-op when not recording): the
-          @@ -55,7 +60,8 @@
+          @@ -55,13 +61,14 @@
                        SessionRecorder.shared.appendPlaybackAudio(buffer, at: when)
                    }
            
@@ -5225,7 +5342,14 @@ jobs:
                    print("[AudioPlayback] Engine started")
                }
            
-          @@ -78,7 +84,9 @@
+               /// Teardown audio engine
+               func teardown() {
+          -        playerNode?.stop()
+          +        stop()
+                   audioEngine?.stop()
+                   audioEngine = nil
+                   playerNode = nil
+          @@ -78,7 +85,9 @@
                    }
            
                    // Convert Int16 PCM to Float32
@@ -5236,7 +5360,7 @@ jobs:
            
                    // Create buffer
                    let outputFormat = engine.outputNode.outputFormat(forBus: 0)
-          @@ -87,7 +95,7 @@
+          @@ -87,23 +96,25 @@
                    // Resample if needed
                    let resampledSamples: [Float]
                    if inputSampleRate != outputSampleRate {
@@ -5245,7 +5369,37 @@ jobs:
                    } else {
                        resampledSamples = floatSamples
                    }
-          @@ -123,45 +131,9 @@
+           
+          +        guard !resampledSamples.isEmpty else { return }
+                   guard let buffer = createBuffer(from: resampledSamples, format: outputFormat) else {
+                       print("[AudioPlayback] Failed to create buffer")
+                       return
+                   }
+           
+                   // Schedule and play
+          -        player.scheduleBuffer(buffer) { [weak self] in
+          +        let token = queueState.enqueue()
+          +        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                       Task { @MainActor in
+          -                // Check if more audio is queued
+          -                if self?.playerNode?.isPlaying == false {
+          -                    self?.isPlaying = false
+          -                    self?.onPlaybackComplete?()
+          +                guard let self else { return }
+          +                if self.queueState.complete(token) {
+          +                    self.isPlaying = false
+          +                    self.onPlaybackComplete?()
+                           }
+                       }
+                   }
+          @@ -117,51 +128,16 @@
+           
+               /// Stop playback
+               func stop() {
+          +        queueState.reset()
+                   playerNode?.stop()
+                   isPlaying = false
+               }
            
                // MARK: - Conversion
            
@@ -5374,6 +5528,30 @@ jobs:
           +            let next = min(index + 1, samples.count - 1)
           +            return samples[index] * (1 - fraction) + samples[next] * fraction
           +        }
+          +    }
+          +}
+          --- /dev/null
+          +++ b/OpenVision/Services/Audio/PlaybackQueueState.swift
+          @@ -0,0 +1,21 @@
+          +import Foundation
+          +
+          +/// Player-node `isPlaying` remains true after the last buffer. Track buffers, not the node.
+          +struct PlaybackQueueState {
+          +    private(set) var pendingCount = 0
+          +    private var generation = UUID()
+          +    mutating func enqueue() -> UUID {
+          +        pendingCount += 1
+          +        return generation
+          +    }
+          +    /// True only when the final current-generation buffer has actually played back.
+          +    mutating func complete(_ token: UUID) -> Bool {
+          +        guard token == generation, pendingCount > 0 else { return false }
+          +        pendingCount -= 1
+          +        return pendingCount == 0
+          +    }
+          +    mutating func reset() {
+          +        generation = UUID()
+          +        pendingCount = 0
           +    }
           +}
           --- a/OpenVision/Services/GeminiLive/GeminiLiveService.swift
@@ -8261,7 +8439,7 @@ jobs:
                        }
                    }
            
-          @@ -108,6 +123,23 @@
+          @@ -108,6 +123,25 @@
                // MARK: - View lifecycle
            
                func onAppear() {
@@ -8269,9 +8447,11 @@ jobs:
           +            guard let self else { return false }
           +            return !self.isChangingLiveMode && !self.isStoppingSession
           +                && !self.commandTurnActive && self.agentState != .thinking && self.agentState != .connecting
+          +                && self.agentState != .toolRunning && self.agentState != .speaking
           +                && !self.ttsService.isSpeaking && !KokoroTTSService.shared.isSpeaking
           +                && !self.audioPlayback.isPlaying
           +                && (!self.isLiveVideoMode || self.activeLiveService === self.geminiLive)
+          +                && (!self.isLiveVideoMode || (!self.geminiLive.isProcessing && !self.geminiLive.isModelSpeaking))
           +                && (!self.isLiveVideoMode || Date().timeIntervalSince(self.lastLiveConversationAt) >= 12)
           +        }
           +        CityGuideService.shared.narrateWithAssistant = { [weak self] source in
@@ -8285,7 +8465,7 @@ jobs:
                    setupVoiceCommandService()
                    setupGlassesCallbacks()
                    preloadLocalModelIfNeeded()
-          @@ -120,12 +152,22 @@
+          @@ -120,12 +154,22 @@
                }
            
                func onDisappear() {
@@ -8309,7 +8489,7 @@ jobs:
                    if isSpeaking {
                        agentState = .speaking
                        // Pause barge-in detection while TTS is playing
-          @@ -183,6 +225,12 @@
+          @@ -183,6 +227,12 @@
                }
            
                func voiceStateChanged(_ newState: VoiceCommandService.ListeningState) {
@@ -8322,7 +8502,7 @@ jobs:
                    print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
                    switch newState {
                    case .idle:
-          @@ -254,6 +302,7 @@
+          @@ -254,6 +304,7 @@
                }
            
                func startSession() {
@@ -8330,7 +8510,7 @@ jobs:
                    // Check configuration
                    guard settingsManager.settings.isCurrentBackendConfigured else {
                        errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-          @@ -262,6 +311,16 @@
+          @@ -262,6 +313,16 @@
            
                    isSessionActive = true
                    agentState = .connecting
@@ -8347,7 +8527,7 @@ jobs:
            
                    // Model memory follows the History conversation window (5-min inactivity), NOT the wake
                    // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-          @@ -276,7 +335,8 @@
+          @@ -276,7 +337,8 @@
                    configureAudioForGlasses()
            
                    // Connect to AI backend
@@ -8357,7 +8537,7 @@ jobs:
                        do {
                            switch settingsManager.settings.aiBackend {
                            case .openClaw:
-          @@ -309,6 +369,8 @@
+          @@ -309,6 +371,8 @@
                                )
                            }
            
@@ -8366,7 +8546,7 @@ jobs:
                            agentState = .listening
                            userTranscript = ""
                            aiTranscript = ""
-          @@ -321,10 +383,14 @@
+          @@ -321,10 +385,14 @@
                                // Put in listening mode (not waiting for wake word)
                                voiceCommandService.enterConversationMode()
                            } else {
@@ -8384,7 +8564,7 @@ jobs:
                            errorMessage = "Failed to connect: \(error.localizedDescription)"
                            isSessionActive = false
                            agentState = .idle
-          @@ -382,14 +448,33 @@
+          @@ -382,14 +450,33 @@
                }
            
                func stopSession() {
@@ -8420,7 +8600,7 @@ jobs:
                        switch settingsManager.settings.aiBackend {
                        case .openClaw:
                            await OpenClawService.shared.disconnect()
-          @@ -439,6 +524,7 @@
+          @@ -439,6 +526,7 @@
                /// quiet back to wake-word listening. The recognizer buffer is already reset by
                /// VoiceCommandService (so the stale transcript can't re-fire); here we just halt + end the turn.
                private func performFullStop() {
@@ -8428,7 +8608,7 @@ jobs:
                    // "Ok Vision stop" is an interruption too: the user cut the reply off. Close the turn
                    // deterministically before stopping the engines — delivered-then-stopped turns finish
                    // here (markSpokeDone is gated on firstAudio); a stop mid-thinking leaves the turn open
-          @@ -533,6 +619,8 @@
+          @@ -533,6 +621,8 @@
                    // Wake word detected
                    voiceCommandService.onWakeWordDetected = { [weak self] in
                        guard let self else { return }
@@ -8437,7 +8617,7 @@ jobs:
                        print("[VoiceAgent] Wake word detected!")
                        HapticFeedback.medium()
                        self.soundService.playWakeWordSound()
-          @@ -585,6 +673,11 @@
+          @@ -585,6 +675,11 @@
                            return
                        }
            
@@ -8449,7 +8629,7 @@ jobs:
                        self.userTranscript = command
                        // Suspend ambient narration for the WHOLE turn (through reply playback).
                        self.commandTurnActive = true
-          @@ -614,7 +707,8 @@
+          @@ -614,7 +709,8 @@
                        self.historyAwaitingReply = true
            
                        // Send command to AI backend
@@ -8459,7 +8639,7 @@ jobs:
                            await self.sendCommand(command)
                        }
                    }
-          @@ -692,7 +786,7 @@
+          @@ -692,7 +788,7 @@
                            }
                        }
                        backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
@@ -8468,7 +8648,7 @@ jobs:
                            if isProcessing {
                                self.agentState = .thinking
                                // New reply: reset the sentence-streaming cursor for a clean start.
-          @@ -793,8 +887,15 @@
+          @@ -793,8 +889,15 @@
                    }
                }
            
@@ -8484,7 +8664,7 @@ jobs:
                    guard settingsManager.settings.wakeWordEnabled else { return }
                    guard voiceCommandService.authorizationStatus == .authorized else { return }
            
-          @@ -815,13 +916,20 @@
+          @@ -815,13 +918,20 @@
            
                /// Send command to AI backend
                private func sendCommand(_ command: String) async {
@@ -8506,7 +8686,7 @@ jobs:
                    let stopPhrases = ["be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it"]
                    let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                                         || stopPhrases.contains { lowerCommand.contains($0) })
-          @@ -962,7 +1070,8 @@
+          @@ -962,7 +1072,8 @@
                            agentState = isSessionActive ? .listening : .idle
                        }
                    } catch {
@@ -8516,7 +8696,7 @@ jobs:
                        agentState = isSessionActive ? .listening : .idle
                    }
                }
-          @@ -970,13 +1079,16 @@
+          @@ -970,13 +1081,16 @@
                // MARK: - Live Video Mode
            
                /// Start live video mode - Gemini handles both audio and video
@@ -8534,7 +8714,7 @@ jobs:
                        ttsService.speak("Please connect your glasses first")
                        return
                    }
-          @@ -992,15 +1104,26 @@
+          @@ -992,15 +1106,26 @@
                    // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
                    // otherwise Gemini Live (the default video provider for every other backend).
                    guard let (service, label) = resolveLiveService() else {
@@ -8563,7 +8743,7 @@ jobs:
            
                    // Stop TTS if speaking
                    ttsService.stop()
-          @@ -1011,27 +1134,46 @@
+          @@ -1011,27 +1136,46 @@
                    audioCapture.targetSampleRate = Double(service.inputSampleRate)
                    audioPlayback.inputSampleRate = Double(service.outputSampleRate)
            
@@ -8624,7 +8804,7 @@ jobs:
                        return
                    }
            
-          @@ -1039,42 +1181,68 @@
+          @@ -1039,42 +1183,69 @@
                    setupLiveVideoCallbacks(service)
            
                    // Setup audio capture → live backend
@@ -8690,6 +8870,7 @@ jobs:
           +        isSessionActive = true
                    agentState = .liveVideo
           +        lastLiveMicrophoneBufferAt = Date()
+          +        lastLiveConversationAt = Date()
           +        liveMicrophoneWatchdog?.invalidate()
           +        liveMicrophoneWatchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
           +            Task { @MainActor in
@@ -8709,7 +8890,7 @@ jobs:
                }
            
                /// Resolve which live-video backend to use, or nil if none is configured.
-          @@ -1486,89 +1654,217 @@
+          @@ -1486,89 +1657,217 @@
                    return glassesManager.lastFrame   // fallback: better an old frame than nothing
                }
            
@@ -8990,7 +9171,7 @@ jobs:
                            }
                        }
                    }
-          @@ -1589,6 +1885,10 @@
+          @@ -1589,6 +1888,10 @@
                            MetricsCollector.shared.count(liveTurnEvent)
                            // History: persist this live-video exchange (transcript only, no frames).
                            self?.recordLiveTurn()
@@ -9001,7 +9182,7 @@ jobs:
                        }
                    }
            
-          @@ -1598,6 +1898,7 @@
+          @@ -1598,6 +1901,7 @@
                            guard let self else { return }
                            if self.isLiveVideoMode {
                                print("[VoiceAgent] Live backend disconnected unexpectedly")
@@ -9009,7 +9190,7 @@ jobs:
                                await self.stopLiveVideoMode()
                            }
                        }
-          @@ -1969,8 +2270,15 @@
+          @@ -1969,8 +2273,15 @@
                    // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
                    glassesManager.onVideoFrame = { [weak self] image in
                        guard let self else { return }
@@ -9027,7 +9208,7 @@ jobs:
            
                        // Log periodically (every 30 frames = ~1 second at 30fps)
                        Task { @MainActor in
-          @@ -2261,3 +2569,21 @@
+          @@ -2261,3 +2572,21 @@
                    return result
                }
            }
@@ -9155,6 +9336,43 @@ jobs:
           +        let result = try await CityGuideTool().execute(args: [:])
           +        XCTAssertTrue(result.contains("kapalı"))
           +        XCTAssertTrue(CityGuideService.shared.places.isEmpty)
+          +    }
+          +}
+          --- /dev/null
+          +++ b/OpenVisionTests/PlaybackQueueTests.swift
+          @@ -0,0 +1,34 @@
+          +import XCTest
+          +@testable import OpenVision
+          +
+          +final class PlaybackQueueTests: XCTestCase {
+          +    func testFinalBufferEndsPlaybackExactlyOnce() {
+          +        var queue = PlaybackQueueState()
+          +        let first = queue.enqueue()
+          +        let second = queue.enqueue()
+          +        XCTAssertEqual(queue.pendingCount, 2)
+          +        XCTAssertFalse(queue.complete(first))
+          +        XCTAssertEqual(queue.pendingCount, 1)
+          +        XCTAssertTrue(queue.complete(second))
+          +        XCTAssertEqual(queue.pendingCount, 0)
+          +        XCTAssertFalse(queue.complete(second))
+          +    }
+          +    func testOldCompletionAfterStopCannotEndNewReply() {
+          +        var queue = PlaybackQueueState()
+          +        let old = queue.enqueue()
+          +        queue.reset()
+          +        let current = queue.enqueue()
+          +        XCTAssertFalse(queue.complete(old))
+          +        XCTAssertEqual(queue.pendingCount, 1)
+          +        XCTAssertTrue(queue.complete(current))
+          +    }
+          +    func testStopClearsEveryQueuedBuffer() {
+          +        var queue = PlaybackQueueState()
+          +        let token = queue.enqueue()
+          +        _ = queue.enqueue()
+          +        _ = queue.enqueue()
+          +        queue.reset()
+          +        XCTAssertEqual(queue.pendingCount, 0)
+          +        XCTAssertFalse(queue.complete(token))
           +    }
           +}
           --- /dev/null
@@ -9312,6 +9530,7 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/AudioPlaybackService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/MicrophoneInputRouter.swift
           xcrun swiftc -frontend -parse OpenVision/Services/Audio/PCMCodec.swift
+          xcrun swiftc -frontend -parse OpenVision/Services/Audio/PlaybackQueueState.swift
           xcrun swiftc -frontend -parse OpenVision/Services/GeminiLive/GeminiLiveService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/NativeTools/CityGuideService.swift
           xcrun swiftc -frontend -parse OpenVision/Services/NativeTools/NativeTool.swift
@@ -9333,6 +9552,7 @@ jobs:
           xcrun swiftc -frontend -parse OpenVision/Views/VoiceAgent/VoiceAgentViewModel.swift
           xcrun swiftc -frontend -parse OpenVisionTests/AssistantSafetyTests.swift
           xcrun swiftc -frontend -parse OpenVisionTests/GuideSafetyTests.swift
+          xcrun swiftc -frontend -parse OpenVisionTests/PlaybackQueueTests.swift
           xcrun swiftc -frontend -parse OpenVisionUITests/NativeInterfaceTests.swift
           cat > build/live_control_tests.swift <<'LIVE_CONTROL_TESTS'
           import Foundation
